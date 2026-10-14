@@ -338,7 +338,7 @@ impl Codec {
     }
 
     /// A fresh streaming decoder whose buffers hold passes of up to `pass` frames: its memory grows with
-    /// `pass`, about 1.6 GiB at FRONT_CHUNK, so a stream fed a few frames at a time takes a small one.
+    /// `pass`, so a stream fed a few frames at a time takes a small one.
     pub fn stream_for(&self, pass: usize) -> Result<DecodeStream> {
         let pass = pass.clamp(1, FRONT_CHUNK);
         let chunk = 4 * pass;
