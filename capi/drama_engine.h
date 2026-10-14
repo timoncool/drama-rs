@@ -17,7 +17,7 @@ typedef struct DramaParams {
     int32_t top_k;     /* 30 */
     float top_p;       /* 0.9 */
     uint64_t seed;
-    uint32_t max_new;  /* most frames (21.5 per second of speech) for the whole text */
+    uint32_t max_new;  /* most frames (21.5 per second of speech) of each sentence */
 } DramaParams;
 
 const char *drama_version(void);

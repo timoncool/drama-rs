@@ -275,6 +275,7 @@ fn inv_freq(theta: f64, rot: usize) -> Vec<f32> {
 
 impl Model {
     pub fn load(dir: &Path, stream: &Stream) -> Result<Self> {
+        let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
             bail!("unsupported converted format in {}", dir.display());
@@ -317,9 +318,13 @@ impl Model {
                 down: l.q4("moe.down")?,
             });
             stream.sync()?;
-            eprint!("\rloading weights: layer {}/{}", i + 1, tc.num_hidden_layers);
+            if progress {
+                eprint!("\rloading weights: layer {}/{}", i + 1, tc.num_hidden_layers);
+            }
         }
-        eprintln!();
+        if progress {
+            eprintln!();
+        }
 
         let file = File::open(&dir.join("tower.safetensors"))?;
         let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded };

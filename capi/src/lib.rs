@@ -161,6 +161,7 @@ pub unsafe extern "C" fn drama_speak(
             first_chunk: 16,
             chunk: 16,
             split: true,
+            keep_stalled: false,
         };
         let result = tts.speak(&text, &[voice], &opts, |_| Ok(()));
         engine.stop.store(false, Ordering::Relaxed);

@@ -26,12 +26,16 @@ pub struct Tts {
 
 pub struct SpeakOpts {
     pub params: SampleParams,
+    /// Most frames per sentence with `split`, for the whole text without it.
     pub max_new: usize,
     /// Frames in the first streamed chunk (small = low latency) and in later ones.
     pub first_chunk: usize,
     pub chunk: usize,
     /// Generate sentence by sentence (see `Tts::speak`).
     pub split: bool,
+    /// A sentence that ran into its cap and is said again keeps its stalled audio in the output (it was already
+    /// streamed). False: a sentence reaches the decoder only once it ended, so the output has no stalled audio.
+    pub keep_stalled: bool,
 }
 
 pub struct Spoken {
@@ -173,15 +177,27 @@ impl Tts {
                         let mut params = opts.params;
                         params.seed = params.seed.wrapping_add(i as u64).wrapping_add(attempt as u64 * 1000);
                         seg_frames = engine.generate(&rows, params, opts.max_new.min(cap), |frame| {
-                            let _ = tx.send(frame[1..].to_vec());
+                            if opts.keep_stalled {
+                                let _ = tx.send(frame[1..].to_vec());
+                            }
                         })?;
                         stalled = seg_frames.len() >= cap;
-                        if !stalled {
+                        if !stalled || (!opts.keep_stalled && attempt == STALL_RETRIES) {
+                            if !opts.keep_stalled {
+                                let _ = tx.send(seg_frames.iter().flat_map(|f| f[1..].iter().copied()).collect());
+                            }
+                            if stalled {
+                                eprintln!("sentence {} ran into its {cap}-frame cap on every attempt", i + 1);
+                            }
                             break;
                         }
-                        // Its audio was played, so it stays in the output.
-                        frames.extend(seg_frames.drain(..));
                         eprintln!("sentence {} ran into its {cap}-frame cap without ending (attempt {})", i + 1, attempt + 1);
+                        if opts.keep_stalled {
+                            // Its audio was played, so it stays in the output.
+                            frames.extend(seg_frames.drain(..));
+                        } else {
+                            seg_frames.clear();
+                        }
                     }
                     if let Some(sp) = prompt::sole_speaker(seg) {
                         if opts.split && !stalled && !seg_frames.is_empty() && !voiced.contains(&sp) {

@@ -173,7 +173,7 @@ fn main() -> Result<()> {
                 eprintln!("reference {}: {} frames in {:.0} ms", wav.display(), r.codes[0].len(), t1.elapsed().as_secs_f64() * 1e3);
                 refs.push(r);
             }
-            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split };
+            let opts = tts::SpeakOpts { params: common.params(), max_new, first_chunk, chunk: stream_chunk, split: !no_split, keep_stalled: true };
             let mut player = if play { Some(tts::Player::new()?) } else { None };
             let lines: Box<dyn Iterator<Item = String>> = match text {
                 Some(t) if !interactive => Box::new(std::iter::once(t)),
