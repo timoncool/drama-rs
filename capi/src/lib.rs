@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,6 +138,42 @@ pub unsafe extern "C" fn drama_speak(
     engine: *mut DramaEngine, text: *const c_char, ref_wav: *const c_char, ref_text: *const c_char, params: *const DramaParams,
     out_audio: *mut *mut f32, out_len: *mut usize,
 ) -> i32 {
+    speak(engine, text, ref_wav, ref_text, params, |_| {}, out_audio, out_len)
+}
+
+/// Called with each decoded piece of audio while `drama_speak_stream` runs, on the engine's codec thread.
+pub type DramaChunkFn = Option<unsafe extern "C" fn(audio: *const f32, len: usize, user: *mut c_void)>;
+
+/// # Safety
+/// As `drama_speak`; `on_chunk` (may be null) is safe to call from another thread with `user`.
+#[no_mangle]
+pub unsafe extern "C" fn drama_speak_stream(
+    engine: *mut DramaEngine, text: *const c_char, ref_wav: *const c_char, ref_text: *const c_char, params: *const DramaParams,
+    on_chunk: DramaChunkFn, user: *mut c_void, out_audio: *mut *mut f32, out_len: *mut usize,
+) -> i32 {
+    let user = UserPtr(user);
+    speak(engine, text, ref_wav, ref_text, params, move |a: &[f32]| {
+        if let Some(f) = on_chunk {
+            f(a.as_ptr(), a.len(), user.get());
+        }
+    }, out_audio, out_len)
+}
+
+#[derive(Clone, Copy)]
+struct UserPtr(*mut c_void);
+unsafe impl Send for UserPtr {}
+
+impl UserPtr {
+    fn get(self) -> *mut c_void {
+        self.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn speak(
+    engine: *mut DramaEngine, text: *const c_char, ref_wav: *const c_char, ref_text: *const c_char, params: *const DramaParams,
+    mut on_chunk: impl FnMut(&[f32]) + Send, out_audio: *mut *mut f32, out_len: *mut usize,
+) -> i32 {
     let Some(engine) = engine.as_ref() else {
         set_error("engine is null");
         return DRAMA_ERROR;
@@ -163,7 +199,10 @@ pub unsafe extern "C" fn drama_speak(
             split: true,
             keep_stalled: false,
         };
-        let result = tts.speak(&text, &[voice], &opts, |_| Ok(()));
+        let result = tts.speak(&text, &[voice], &opts, |a| {
+            on_chunk(a);
+            Ok(())
+        });
         engine.stop.store(false, Ordering::Relaxed);
         match result {
             Ok(s) => Ok(s.audio),

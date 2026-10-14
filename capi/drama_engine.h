@@ -32,6 +32,13 @@ void drama_free(DramaEngine *engine);
  * samples, to be released with drama_free_audio. */
 int32_t drama_speak(DramaEngine *engine, const char *text, const char *ref_wav, const char *ref_text,
                     const DramaParams *params, float **out_audio, size_t *out_len);
+/* Called with each decoded piece of audio (a sentence or more) while drama_speak_stream runs, on another
+ * thread; `audio` is valid only during the call. */
+typedef void (*DramaChunkFn)(const float *audio, size_t len, void *user);
+/* As drama_speak, and on_chunk (may be NULL) gets the audio as it is decoded; *out_audio still holds all of it. */
+int32_t drama_speak_stream(DramaEngine *engine, const char *text, const char *ref_wav, const char *ref_text,
+                           const DramaParams *params, DramaChunkFn on_chunk, void *user, float **out_audio,
+                           size_t *out_len);
 void drama_free_audio(float *audio, size_t len);
 void drama_cancel(DramaEngine *engine);
 
