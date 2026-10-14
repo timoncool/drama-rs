@@ -121,7 +121,7 @@ impl Tts {
 
         let (gen, decoded) = std::thread::scope(|scope| -> Result<_> {
             let worker = scope.spawn(move || -> Result<(Vec<f32>, Option<Duration>)> {
-                let mut ds = codec.stream()?;
+                let mut ds = codec.stream_for(first.max(chunk))?;
                 let mut pending: Vec<i32> = Vec::new();
                 let mut audio = Vec::new();
                 let mut first_audio = None;

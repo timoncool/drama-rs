@@ -30,8 +30,6 @@ const DILATIONS: [usize; 3] = [1, 3, 9];
 /// Frames per front pass, and the ring size of the transformer KV cache (window + chunk).
 const FRONT_CHUNK: usize = 128;
 const RING: usize = WINDOW as usize + FRONT_CHUNK;
-/// Latent rows (86 Hz) per decoder-stack pass.
-const CHUNK: usize = 4 * FRONT_CHUNK;
 
 struct T {
     buf: DevBuf,
@@ -137,6 +135,8 @@ fn h(b: &DevBuf) -> *mut u16 {
 
 /// Streaming decoder state for one utterance.
 pub struct DecodeStream {
+    /// Most frames one pass takes: the buffers below are sized for it.
+    pass: usize,
     frames_done: usize,
     caches: Vec<(DevBuf, DevBuf)>,
     up: Vec<Stage>,
@@ -332,12 +332,20 @@ impl Codec {
         codes.download::<i32>(frames * NCB, st)
     }
 
-    /// A fresh streaming decoder.
+    /// A fresh streaming decoder for passes of up to FRONT_CHUNK frames.
     pub fn stream(&self) -> Result<DecodeStream> {
+        self.stream_for(FRONT_CHUNK)
+    }
+
+    /// A fresh streaming decoder whose buffers hold passes of up to `pass` frames: its memory grows with
+    /// `pass`, about 1.6 GiB at FRONT_CHUNK, so a stream fed a few frames at a time takes a small one.
+    pub fn stream_for(&self, pass: usize) -> Result<DecodeStream> {
+        let pass = pass.clamp(1, FRONT_CHUNK);
+        let chunk = 4 * pass;
         let st = &self.st;
         let mut blocks = Vec::new();
         let mut c_in = DEC_IN;
-        let mut cap = CHUNK;
+        let mut cap = chunk;
         for &r in &RATES {
             let c_out = c_in / 2;
             cap *= r;
@@ -347,18 +355,19 @@ impl Codec {
             c_in = c_out;
         }
         let ds = DecodeStream {
+            pass,
             frames_done: 0,
             caches: alloc_caches(8, RING)?,
-            up: vec![Stage::new(6, 2 * FRONT_CHUNK, D, st)?, Stage::new(6, 4 * FRONT_CHUNK, D, st)?],
-            stage_in: Stage::new(6, CHUNK, D, st)?,
+            up: vec![Stage::new(6, 2 * pass, D, st)?, Stage::new(6, 4 * pass, D, st)?],
+            stage_in: Stage::new(6, chunk, D, st)?,
             out_stage: Stage::new(6, cap, c_in, st)?,
             blocks,
-            scr: FrontScratch::new(4 * FRONT_CHUNK)?,
-            x: DevBuf::alloc(4 * FRONT_CHUNK * D * 4)?,
-            codes: DevBuf::alloc(FRONT_CHUNK * NCB * 4)?,
-            col: DevBuf::alloc((cap * 7 * 96).max(CHUNK * 8 * 2 * DEC_IN).max(CHUNK * 7 * D) * 2)?,
-            tmp: DevBuf::alloc(cap * 96 * 4 + CHUNK * 8 * DEC_IN * 4)?,
-            gem: DevBuf::alloc(cap * 96 * 4 + CHUNK * 8 * DEC_IN * 4)?,
+            scr: FrontScratch::new(4 * pass)?,
+            x: DevBuf::alloc(4 * pass * D * 4)?,
+            codes: DevBuf::alloc(pass * NCB * 4)?,
+            col: DevBuf::alloc((cap * 7 * 96).max(chunk * 8 * 2 * DEC_IN).max(chunk * 7 * D) * 2)?,
+            tmp: DevBuf::alloc(cap * 96 * 4 + chunk * 8 * DEC_IN * 4)?,
+            gem: DevBuf::alloc(cap * 96 * 4 + chunk * 8 * DEC_IN * 4)?,
             audio: DevBuf::alloc(cap * 4)?,
         };
         st.sync()?;
@@ -368,12 +377,12 @@ impl Codec {
     /// Feed the next frames ([n][10] codes) and get their audio (n * FRAME_SAMPLES samples).
     pub fn decode_chunk(&self, ds: &mut DecodeStream, codes: &[i32]) -> Result<Vec<f32>> {
         let mut audio = Vec::with_capacity(codes.len() / NCB * FRAME_SAMPLES);
-        for part in codes.chunks(FRONT_CHUNK * NCB) {
+        for part in codes.chunks(ds.pass * NCB) {
             self.front(ds, part)?;
             let rows = part.len() / NCB * 4;
             let mut r0 = 0;
             while r0 < rows {
-                let n = (rows - r0).min(CHUNK);
+                let n = (rows - r0).min(4 * ds.pass);
                 audio.extend(self.convs(ds, unsafe { ds.x.ptr::<f32>().add(r0 * D) }, n)?);
                 r0 += n;
             }
