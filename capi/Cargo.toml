@@ -1,0 +1,18 @@
+[package]
+name = "drama-engine"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI over drama-rs (Fish Audio Drama 3 TTS): drama_engine.dll / libdrama_engine.so for programs that load it at run time"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "drama_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+drama-rs = { path = "..", default-features = false }
+
+[profile.release]
+debug = 0
+strip = true

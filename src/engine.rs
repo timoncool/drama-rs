@@ -124,7 +124,21 @@ pub struct Engine {
     graph: Option<Graph>,
     frame_host: Pinned<i32>,
     pub trace_logits: bool,
+    /// Set from any thread to end the running `generate` at its next frame with [`Cancelled`].
+    pub stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The error `generate` ends with when [`Engine::stop`] was set.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("generation cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 pub struct StepTrace {
     pub main_logits: Vec<f32>,
@@ -327,6 +341,7 @@ impl Engine {
             graph: None,
             frame_host: Pinned::new(width)?,
             trace_logits: false,
+            stop: Default::default(),
             model,
         };
         engine.st.sync()?;
@@ -1044,6 +1059,9 @@ impl Engine {
         let room = self.max_len - rows;
         let mut out = Vec::new();
         for _ in 0..max_new.min(room) {
+            if self.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Cancelled.into());
+            }
             let (frame, _) = self.step()?;
             if frame[0] == self.model.cfg.eos_token_id {
                 break;
