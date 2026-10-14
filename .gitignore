@@ -8,3 +8,4 @@ __pycache__/
 website/node_modules/
 website/dist/
 capi/target
+capi/target-release
