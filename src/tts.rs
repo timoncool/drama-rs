@@ -18,8 +18,10 @@ use crate::engine::{Engine, SampleParams};
 use crate::model::{Experts, Model};
 use crate::prompt::{self, Reference};
 
-/// VRAM left to other programs when the engine sizes itself to the free VRAM.
-pub const AUTO_MARGIN: usize = 1 << 30;
+/// VRAM left to other programs when the engine sizes itself to the free VRAM: a sixteenth of it, 256 MiB to 1 GiB.
+pub fn auto_margin(free: usize) -> usize {
+    (free / 16).clamp(256 << 20, 1 << 30)
+}
 /// VRAM the codec allocates while it encodes references and decodes speech.
 const CODEC_WORK: usize = 768 << 20;
 
@@ -91,24 +93,35 @@ impl Tts {
     }
 
     /// `vram_limit`: most VRAM the engine takes, codec included (0: the whole model if it fits in the free VRAM, else
-    /// what is free less AUTO_MARGIN). The routed experts stay on the GPU when the whole model fits the limit; otherwise
+    /// what is free less `auto_margin`). The routed experts stay on the GPU when the whole model fits the limit; otherwise
     /// they live in RAM and an expert cache takes what the limit leaves. The output is the same either way, a larger
     /// cache only makes it faster.
     pub fn load_with(model_dir: &Path, max_len: usize, chunk: usize, vram_limit: usize) -> Result<Self> {
         let (free0, _) = crate::gpu::mem_info()?;
         let fit_limit = if vram_limit == 0 { free0 } else { vram_limit };
-        let limit = if vram_limit == 0 { free0.saturating_sub(AUTO_MARGIN) } else { vram_limit };
-        let codec = Codec::load(&model_dir.join("codec.safetensors"))?;
+        let limit = if vram_limit == 0 { free0.saturating_sub(auto_margin(free0)) } else { vram_limit };
+        let codec_path = model_dir.join("codec.safetensors");
+        let (enc_bytes, dec_bytes) = Codec::sizes(&codec_path)?;
+        let whole = enc_bytes + dec_bytes + crate::model::full_vram(model_dir)? <= fit_limit as u64;
+        let experts = if whole { Experts::Vram } else { Experts::Ram };
+        let codec = Codec::load(&codec_path, !whole)?;
         let st = crate::gpu::Stream::new()?;
         let (free1, _) = crate::gpu::mem_info()?;
         let codec_vram = free0.saturating_sub(free1);
-        let experts = if codec_vram as u64 + crate::model::full_vram(model_dir)? <= fit_limit as u64 { Experts::Vram } else { Experts::Ram };
         let model = Model::load(model_dir, &st, experts)?;
         // what the limit leaves after everything loaded so far, less the codec's working memory, goes to the cache
         let (free2, _) = crate::gpu::mem_info()?;
         let used = free0.saturating_sub(free2);
         let keep_free = free2.saturating_sub(limit.saturating_sub(used)) + CODEC_WORK;
         let engine = Engine::new(model, max_len, chunk, keep_free)?;
+        let (free3, _) = crate::gpu::mem_info()?;
+        let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+        eprintln!(
+            "VRAM: codec {:.2} GiB, weights {:.2} GiB, engine (buffers and expert cache) {:.2} GiB",
+            gib(codec_vram),
+            gib(used.saturating_sub(codec_vram)),
+            gib(free2.saturating_sub(free3))
+        );
         let tok = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
         Ok(Self { engine, codec, tok })
     }

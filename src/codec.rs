@@ -12,7 +12,7 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
 use crate::ffi;
-use crate::gpu::{check, launched, Cublas, DevBuf, Stream};
+use crate::gpu::{check, launched, Cublas, DevBuf, HostBuf, Stream};
 
 pub const SAMPLE_RATE: u32 = 44100;
 /// Audio samples per frame of codes.
@@ -31,8 +31,24 @@ const DILATIONS: [usize; 3] = [1, 3, 9];
 const FRONT_CHUNK: usize = 128;
 const RING: usize = WINDOW as usize + FRONT_CHUNK;
 
-struct T {
-    buf: DevBuf,
+/// A weight: in VRAM, or in mapped page-locked RAM the kernels read over PCIe.
+enum T {
+    Dev(DevBuf),
+    Host(HostBuf),
+}
+
+impl T {
+    fn ptr<P>(&self) -> *mut P {
+        match self {
+            T::Dev(b) => b.ptr::<P>(),
+            T::Host(b) => b.dev::<P>(),
+        }
+    }
+}
+
+/// Weights only the encoder (reference voices) reads.
+fn encoder_only(name: &str) -> bool {
+    ["enc.", "down0.", "down1.", "pre.", "vq"].iter().any(|p| name.starts_with(p))
 }
 
 /// One layer's input: `ctx` rows of history followed by up to `cap` current rows.
@@ -155,7 +171,9 @@ pub struct DecodeStream {
 unsafe impl Send for DecodeStream {}
 
 impl Codec {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `encoder_in_ram`: the encoder's weights stay in RAM (it runs once per reference voice), leaving their VRAM to
+    /// the decoder and the LM.
+    pub fn load(path: &Path, encoder_in_ram: bool) -> Result<Self> {
         let st = Stream::new()?;
         let blas = Cublas::new(&st)?;
         let file = std::fs::File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
@@ -166,7 +184,8 @@ impl Codec {
             if !matches!(view.dtype(), Dtype::F32 | Dtype::F16) {
                 bail!("{name}: unexpected dtype {:?}", view.dtype());
             }
-            t.insert(name.to_string(), T { buf: DevBuf::from_bytes(view.data(), &st)? });
+            let w = if encoder_in_ram && encoder_only(&name) { T::Host(HostBuf::from_bytes(view.data())?) } else { T::Dev(DevBuf::from_bytes(view.data(), &st)?) };
+            t.insert(name.to_string(), w);
         }
         let inv: Vec<f32> = (0..32).map(|i| 1.0f32 / 10000f32.powf((2 * i) as f32 / 64.0)).collect();
         let inv_freq = DevBuf::from_slice(&inv, &st)?;
@@ -174,14 +193,26 @@ impl Codec {
         Ok(Self { t, inv_freq, blas, st })
     }
 
+    /// Bytes of the encoder's weights and of the rest, from the file header.
+    pub fn sizes(path: &Path) -> Result<(u64, u64)> {
+        let file = std::fs::File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+        let map = unsafe { Mmap::map(&file)? };
+        let sf = SafeTensors::deserialize(&map)?;
+        let (mut enc, mut rest) = (0u64, 0u64);
+        for (name, view) in sf.tensors() {
+            *if encoder_only(&name) { &mut enc } else { &mut rest } += view.data().len() as u64;
+        }
+        Ok((enc, rest))
+    }
+
     fn w(&self, name: &str) -> Result<&T> {
         self.t.get(name).ok_or_else(|| anyhow!("codec tensor {name} missing"))
     }
     fn p32(&self, name: &str) -> Result<*const f32> {
-        Ok(f(&self.w(name)?.buf))
+        Ok(self.w(name)?.ptr())
     }
     fn p16(&self, name: &str) -> Result<*const u16> {
-        Ok(h(&self.w(name)?.buf))
+        Ok(self.w(name)?.ptr())
     }
 
     fn s(&self) -> ffi::Stream {

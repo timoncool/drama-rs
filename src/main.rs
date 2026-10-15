@@ -239,7 +239,7 @@ fn main() -> Result<()> {
         }
         Cmd::Decode { codec: codec_path, codes, out, stream_chunk } => {
             let raw = read_i32(&codes)?;
-            let codec = codec::Codec::load(&codec_path)?;
+            let codec = codec::Codec::load(&codec_path, false)?;
             let t1 = Instant::now();
             let audio = if stream_chunk == 0 {
                 codec.decode(&raw)?
@@ -255,7 +255,7 @@ fn main() -> Result<()> {
             codec::write_wav(&out, &audio)?;
         }
         Cmd::Encode { codec: codec_path, wav, out } => {
-            let codec = codec::Codec::load(&codec_path)?;
+            let codec = codec::Codec::load(&codec_path, false)?;
             let (audio, sr) = codec::read_wav(&wav)?;
             let audio = codec::resample(&audio, sr, codec::SAMPLE_RATE);
             let t1 = Instant::now();

@@ -31,7 +31,9 @@ and the rest of the limit becomes a VRAM cache of experts shared by all layers. 
 step stays one graph replay. Eviction is GCLOCK (a hit raises a slot's count up to 3, the hand lowers it), all state
 on the GPU. The prefill reads cached experts from their slots and streams the others, 64 at a time. A prompt whose
 voice part (the reference) is the same as the last one starts from the saved state after it, so only the text is
-prefilled. The output is bit-identical to the experts-in-VRAM run; a smaller cache only means more copies.
+prefilled. The codec's encoder (it runs once per reference voice) reads its weights from page-locked RAM too, which
+leaves 0.4 GiB more to the cache. The output is bit-identical to the experts-in-VRAM run; a smaller cache only means
+more copies.
 
 Measured on an RTX 4090 (PCIe 4.0 x16) with a cloned voice, the second and third of three sentences (the cache is
 warm, the voice part is reused), `--vram-gb` limiting the engine as a smaller card would:
@@ -39,16 +41,22 @@ warm, the voice part is reused), `--vram-gb` limiting the engine as a smaller ca
 | `--vram-gb` | expert cache | cache hits | speed | first audio |
 |---|---|---|---|---|
 | 0 (whole model) | – | – | 7.9× real time | 60 ms |
-| 12 | 7.0 GiB | 83% | 4.4× | 230 ms |
-| 8 | 3.0 GiB | 57% | 2.8× | 305 ms |
-| 6 | 1.0 GiB | 34% | 2.1× | 340 ms |
+| 12 | 7.4 GiB | 85% | 4.7× | 220 ms |
+| 8 | 3.4 GiB | 61% | 2.95× | 290 ms |
+| 6 | 1.4 GiB | 39% | 2.25× | 325 ms |
+| 5 | 0.4 GiB | 0% | 1.6× | 365 ms |
+
+The engine needs about 4.8 GiB besides the cache (LM weights 2.8, codec decoder 0.4, buffers 0.7, the codec's working
+memory 0.75), so a 6 GB card, with about 5 GiB free, runs it. With the default limit (0) the engine takes what is free
+less a sixteenth of it (256 MiB to 1 GiB). A cache smaller than one step's 320 experts gets no hits: every expert of
+the step is copied.
 
 The first sentence after loading is slower (about 1.1 s to the first audio), as the empty cache fills.
 
 **RAM: at least 32 GB.** The experts take 18.1 GB of page-locked memory. Windows page-locks only about half of the
 RAM for one process, so by default the engine page-locks at most 45% of the RAM (75% on Linux; `DRAMA_PIN_CAP_GB`
 sets it); the experts past that stay in the mapped model files, and the CPU (AVX2) computes the ones the cache does
-not hold. On a 32 GB machine that is about 3 GB of experts: at an 8 GiB limit 2.1× real time, 350 ms to the first
+not hold. On a 32 GB machine that is about 3 GB of experts: at an 8 GiB limit 2.2× real time, 335 ms to the first
 audio (the CPU's arithmetic differs from the GPU's, so the audio is not bit-identical, the speech is the same).
 With 16 GB of RAM the experts do not fit at all.
 
