@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use drama::engine::{Engine, SampleParams};
-use drama::{codec, gpu, model, tts};
+use drama::{codec, gpu, tts};
 
 #[derive(Parser)]
 #[command(name = "drama", version, about = "Fish Audio Drama 3 text-to-speech")]
@@ -35,16 +35,22 @@ struct Common {
     top_p: f32,
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Most VRAM to take, in GiB (0 = what is free less 1 GiB). When the whole model does not fit, the routed experts
+    /// stay in RAM and a VRAM cache of the ones in use takes the rest of the limit: less VRAM, slower decoding.
+    #[arg(long, default_value_t = 0.0)]
+    vram_gb: f64,
 }
 
 impl Common {
     fn params(&self) -> SampleParams {
         SampleParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, pad: 0, seed: self.seed }
     }
+    fn vram_limit(&self) -> usize {
+        (self.vram_gb * (1u64 << 30) as f64) as usize
+    }
     fn engine(&self) -> Result<Engine> {
-        let st = gpu::Stream::new()?;
-        let model = model::Model::load(&self.model, &st)?;
-        let engine = Engine::new(model, self.max_len, self.chunk)?;
+        let tts = tts::Tts::load_with(&self.model, self.max_len, self.chunk, self.vram_limit())?;
+        let engine = tts.engine;
         let (free, total) = gpu::mem_info()?;
         eprintln!("GPU memory: {:.2} GiB used of {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
         Ok(engine)
@@ -136,6 +142,14 @@ enum Cmd {
     },
 }
 
+fn print_cache_stats(engine: &Engine) -> Result<()> {
+    if let Some((hits, misses)) = engine.cache_stats()? {
+        let all = (hits + misses).max(1);
+        eprintln!("expert cache: {:.1}% of {all} expert reads hit, {misses} copied from RAM", 100.0 * hits as f64 / all as f64);
+    }
+    Ok(())
+}
+
 fn read_i32(path: &PathBuf) -> Result<Vec<i32>> {
     let b = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     Ok(b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect())
@@ -158,7 +172,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("give --text, or --interactive to read lines from stdin");
             }
             let t_load = Instant::now();
-            let mut tts = tts::Tts::load(&common.model, common.max_len, common.chunk)?;
+            let mut tts = tts::Tts::load_with(&common.model, common.max_len, common.chunk, common.vram_limit())?;
             let (free, total) = gpu::mem_info()?;
             eprintln!(
                 "ready in {:.1}s, GPU memory {:.2} / {:.2} GiB",
@@ -198,6 +212,7 @@ fn main() -> Result<()> {
                     audio_s / spoken.elapsed.as_secs_f64(),
                     spoken.first_audio.map(|d| d.as_secs_f64() * 1e3).unwrap_or(f64::NAN),
                 );
+                print_cache_stats(&tts.engine)?;
                 if let Some(path) = &out {
                     let path = if interactive { path.with_file_name(format!("{}-{n}.wav", path.file_stem().unwrap().to_string_lossy())) } else { path.clone() };
                     codec::write_wav(&path, &spoken.audio)?;
@@ -280,6 +295,7 @@ fn main() -> Result<()> {
             }
             let per = t0.elapsed().as_secs_f64() / steps as f64;
             eprintln!("decode: {:.2} ms/frame, {:.1} frames/s, {:.1}x real time", per * 1e3, 1.0 / per, 1.0 / per / 21.533);
+            print_cache_stats(&engine)?;
         }
     }
     Ok(())

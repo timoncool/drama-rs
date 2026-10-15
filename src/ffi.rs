@@ -16,6 +16,7 @@ extern "C" {
     pub fn dr_free(p: *mut c_void) -> i32;
     pub fn dr_host_alloc(p: *mut *mut c_void, n: usize) -> i32;
     pub fn dr_host_free(p: *mut c_void) -> i32;
+    pub fn dr_host_alloc_mapped(p: *mut *mut c_void, dev: *mut *mut c_void, n: usize) -> i32;
     pub fn dr_h2d(d: *mut c_void, h: *const c_void, n: usize, st: Stream) -> i32;
     pub fn dr_d2h(h: *mut c_void, d: *const c_void, n: usize, st: Stream) -> i32;
     pub fn dr_d2d(d: *mut c_void, s: *const c_void, n: usize, st: Stream) -> i32;
@@ -53,7 +54,20 @@ extern "C" {
         gu_q: *const u8, gu_sm: *const Half, d_q: *const u8, d_sm: *const Half, xp: *const Bf16, offsets: *const i32, counts: *const i32,
         act: *mut Bf16, y: *mut f32, e: i32, h: i32, i: i32, st: Stream,
     ) -> i32;
+    pub fn dr_moe_prefill_where(
+        c_gq: *const u8, c_gsm: *const Half, c_dq: *const u8, c_dsm: *const Half, s_gq: *const u8, s_gsm: *const Half, s_dq: *const u8,
+        s_dsm: *const Half, where_: *const i32, xp: *const Bf16, offsets: *const i32, counts: *const i32, act: *mut Bf16, y: *mut f32, e: i32,
+        h: i32, i: i32, st: Stream,
+    ) -> i32;
     pub fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream) -> i32;
+    pub fn dr_expert_slots(
+        idx: *const i32, topk: i32, key0: i32, s: i32, map: *mut i32, owner: *mut i32, refb: *mut u32, tag: *mut u32, state: *mut u32, sidx: *mut i32,
+        fill: *mut i32, st: Stream,
+    ) -> i32;
+    pub fn dr_expert_fill(
+        idx: *const i32, fill: *const i32, topk: i32, g_q: *const c_void, g_sm: *const c_void, d_q: *const c_void, d_sm: *const c_void, c_gq: *mut c_void,
+        c_gsm: *mut c_void, c_dq: *mut c_void, c_dsm: *mut c_void, b_gq: usize, b_gsm: usize, b_dq: usize, b_dsm: usize, st: Stream,
+    ) -> i32;
     pub fn dr_moe_permute(
         idx: *const i32, rows: i32, topk: i32, offsets: *const i32, fill: *mut i32, slot_of: *mut i32, x: *const Bf16, xp: *mut Bf16, h: i32,
         st: Stream,

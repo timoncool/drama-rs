@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use drama::codec;
 use drama::engine::{Cancelled, SampleParams};
+use drama::model::Experts;
 use drama::prompt::Reference;
 use drama::tts::{SpeakOpts, Tts};
 
@@ -81,9 +82,20 @@ pub extern "C" fn drama_last_error() -> *const c_char {
 /// `model_dir` is a NUL-terminated UTF-8 path.
 #[no_mangle]
 pub unsafe extern "C" fn drama_load(model_dir: *const c_char, max_len: u32, prefill_chunk: u32) -> *mut DramaEngine {
+    drama_load_ex(model_dir, max_len, prefill_chunk, 0)
+}
+
+pub const DRAMA_EXPERTS_VRAM: u32 = 1;
+pub const DRAMA_EXPERTS_RAM: u32 = 2;
+
+/// # Safety
+/// `model_dir` is a NUL-terminated UTF-8 path.
+#[no_mangle]
+pub unsafe extern "C" fn drama_load_ex(model_dir: *const c_char, max_len: u32, prefill_chunk: u32, vram_limit_mb: u32) -> *mut DramaEngine {
     let loaded = catch_unwind(AssertUnwindSafe(|| -> Result<DramaEngine, String> {
         let dir = text_arg(model_dir, "model_dir")?;
-        let tts = Tts::load(Path::new(&dir), max_len.max(256) as usize, prefill_chunk.max(16) as usize).map_err(|e| format!("{e:#}"))?;
+        let tts = Tts::load_with(Path::new(&dir), max_len.max(256) as usize, prefill_chunk.max(16) as usize, vram_limit_mb as usize * (1 << 20))
+            .map_err(|e| format!("{e:#}"))?;
         let stop = tts.engine.stop.clone();
         Ok(DramaEngine { tts: Mutex::new(tts), stop, refs: Mutex::new(HashMap::new()) })
     }));
@@ -98,6 +110,36 @@ pub unsafe extern "C" fn drama_load(model_dir: *const c_char, max_len: u32, pref
             std::ptr::null_mut()
         }
     }
+}
+
+/// # Safety
+/// `engine` is live and the outputs are valid (any may be null).
+#[no_mangle]
+pub unsafe extern "C" fn drama_experts(engine: *mut DramaEngine, out_experts: *mut u32, out_hits: *mut u64, out_misses: *mut u64) -> i32 {
+    let Some(e) = engine.as_ref() else {
+        set_error("engine is null");
+        return DRAMA_ERROR;
+    };
+    let tts = e.tts.lock().unwrap_or_else(|p| p.into_inner());
+    let stats = match tts.engine.cache_stats() {
+        Ok(s) => s,
+        Err(err) => {
+            set_error(&format!("{err:#}"));
+            return DRAMA_ERROR;
+        }
+    };
+    let placement = if tts.engine.model.experts == Experts::Ram { DRAMA_EXPERTS_RAM } else { DRAMA_EXPERTS_VRAM };
+    let (hits, misses) = stats.unwrap_or((0, 0));
+    if let Some(p) = out_experts.as_mut() {
+        *p = placement;
+    }
+    if let Some(p) = out_hits.as_mut() {
+        *p = hits;
+    }
+    if let Some(p) = out_misses.as_mut() {
+        *p = misses;
+    }
+    DRAMA_OK
 }
 
 /// # Safety

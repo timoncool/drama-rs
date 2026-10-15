@@ -658,20 +658,42 @@ API int dr_moe_combine(float* x, const float* Y, const int* slot_of, const float
 
 constexpr int PF_TT = 8;
 
+// Bank and index of expert e for a prefill pass. Without `where`, expert e of the bank (Q, SM). With it (experts in
+// RAM): where[e] >= 0 is a slot of the VRAM cache (Q, SM), <= -2 is index -where[e] - 2 of the stage (Q2, SM2), and
+// -1 is an expert this pass skips. Returns false to skip.
+DEV bool pf_expert(int e, const int* where, const uint8_t*& Q, const __half2*& SM, const uint8_t* Q2,
+                   const __half2* SM2, size_t& at) {
+  at = e;
+  if (!where) return true;
+  const int w = where[e];
+  if (w == -1) return false;
+  if (w < -1) {
+    at = (size_t)(-w - 2);
+    Q = Q2;
+    SM = SM2;
+  } else {
+    at = (size_t)w;
+  }
+  return true;
+}
+
 // act[slot, j] = silu(G_e[j] . x_slot) * (U_e[j] . x_slot), bf16. K = 2048, I = 512.
 __global__ void __launch_bounds__(256)
-    k_moe_pf_gate_up(const uint8_t* __restrict__ Q, const __half2* __restrict__ SM, const bf16* __restrict__ xp,
-                     const int* __restrict__ offsets, const int* __restrict__ counts, bf16* __restrict__ act, int I) {
+    k_moe_pf_gate_up(const uint8_t* Q, const __half2* SM, const uint8_t* Q2, const __half2* SM2,
+                     const int* __restrict__ where, const bf16* __restrict__ xp, const int* __restrict__ offsets,
+                     const int* __restrict__ counts, bf16* __restrict__ act, int I) {
   constexpr int K = 2048, CH = K / 32, PAIRS_PER_WARP = 4;
   __shared__ __align__(16) bf16 xs[PF_TT * K];
   __shared__ float xcs[PF_TT * CH];
   const int e = blockIdx.x;
   const int cnt = counts[e];
   if (cnt == 0) return;
+  size_t at;
+  if (!pf_expert(e, where, Q, SM, Q2, SM2, at)) return;
   const int off = offsets[e];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const uint8_t* q = Q + (size_t)e * 2 * I * (K / 2);
-  const __half2* sm = SM + (size_t)e * 2 * I * (K / 64);
+  const uint8_t* q = Q + at * 2 * I * (K / 2);
+  const __half2* sm = SM + at * 2 * I * (K / 64);
   const int j0 = (blockIdx.y * 8 + warp) * PAIRS_PER_WARP;
   for (int t0 = 0; t0 < cnt; t0 += PF_TT) {
     const int nt = min(PF_TT, cnt - t0);
@@ -741,19 +763,22 @@ __global__ void __launch_bounds__(256)
 
 // y[slot, n] = D_e[n] . act_slot (f32). K = I = 512, N = 2048. Half-warps own rows.
 __global__ void __launch_bounds__(256)
-    k_moe_pf_down(const uint8_t* __restrict__ Q, const __half2* __restrict__ SM, const bf16* __restrict__ act,
-                  const int* __restrict__ offsets, const int* __restrict__ counts, float* __restrict__ y, int N) {
+    k_moe_pf_down(const uint8_t* Q, const __half2* SM, const uint8_t* Q2, const __half2* SM2,
+                  const int* __restrict__ where, const bf16* __restrict__ act, const int* __restrict__ offsets,
+                  const int* __restrict__ counts, float* __restrict__ y, int N) {
   constexpr int K = 512, CH = K / 32, ROWS_PER_HALF = 4;
   __shared__ __align__(16) bf16 xs[PF_TT * K];
   __shared__ float xcs[PF_TT * CH];
   const int e = blockIdx.x;
   const int cnt = counts[e];
   if (cnt == 0) return;
+  size_t at;
+  if (!pf_expert(e, where, Q, SM, Q2, SM2, at)) return;
   const int off = offsets[e];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int half = lane >> 4, c = lane & 15;
-  const uint8_t* q = Q + (size_t)e * N * (K / 2);
-  const __half2* sm = SM + (size_t)e * N * (K / 64);
+  const uint8_t* q = Q + at * N * (K / 2);
+  const __half2* sm = SM + at * N * (K / 64);
   const int n0 = ((blockIdx.y * 8 + warp) * 2 + half) * ROWS_PER_HALF;
   for (int t0 = 0; t0 < cnt; t0 += PF_TT) {
     const int nt = min(PF_TT, cnt - t0);
@@ -818,8 +843,139 @@ API int dr_moe_prefill(const uint8_t* gu_q, const __half2* gu_sm, const uint8_t*
                        const bf16* xp, const int* offsets, const int* counts, bf16* act, float* y, int E, int H, int I,
                        cudaStream_t st) {
   if (H != 2048 || I != 512) return -1;
-  k_moe_pf_gate_up<<<dim3(E, (I + 31) / 32), 256, 0, st>>>(gu_q, gu_sm, xp, offsets, counts, act, I);
-  k_moe_pf_down<<<dim3(E, (H + 63) / 64), 256, 0, st>>>(d_q, d_sm, act, offsets, counts, y, H);
+  k_moe_pf_gate_up<<<dim3(E, (I + 31) / 32), 256, 0, st>>>(gu_q, gu_sm, nullptr, nullptr, nullptr, xp, offsets, counts,
+                                                           act, I);
+  k_moe_pf_down<<<dim3(E, (H + 63) / 64), 256, 0, st>>>(d_q, d_sm, nullptr, nullptr, nullptr, act, offsets, counts, y, H);
+  return 0;
+}
+
+// As dr_moe_prefill for experts in RAM: `where` (see pf_expert) picks each expert from the cache banks (c_*) or the
+// stage banks (s_*), or skips it.
+API int dr_moe_prefill_where(const uint8_t* c_gq, const __half2* c_gsm, const uint8_t* c_dq, const __half2* c_dsm,
+                             const uint8_t* s_gq, const __half2* s_gsm, const uint8_t* s_dq, const __half2* s_dsm,
+                             const int* where, const bf16* xp, const int* offsets, const int* counts, bf16* act,
+                             float* y, int E, int H, int I, cudaStream_t st) {
+  if (H != 2048 || I != 512) return -1;
+  k_moe_pf_gate_up<<<dim3(E, (I + 31) / 32), 256, 0, st>>>(c_gq, c_gsm, s_gq, s_gsm, where, xp, offsets, counts, act, I);
+  k_moe_pf_down<<<dim3(E, (H + 63) / 64), 256, 0, st>>>(c_dq, c_dsm, s_dq, s_dsm, where, act, offsets, counts, y, H);
+  return 0;
+}
+
+// ------------------------------------------------------------------------------------------
+// Routed experts kept in mapped host memory, with a cache of S expert slots in VRAM shared by all layers.
+// The decode kernels read a slot bank exactly like an expert bank, with slot ids in place of expert ids.
+//   map[layer * E + e]  slot holding expert e of the layer, or -1
+//   owner[s]            layer * E + e held by slot s, or -1
+//   ref[s]              CLOCK reference bit;  tag[s] the call that last used slot s (never evicted by that call)
+//   state               [0] clock hand, [1] call counter, [2..3] hits (u64), [4..5] misses (u64)
+
+__global__ void __launch_bounds__(32)
+    k_expert_slots(const int* __restrict__ idx, int topk, int key0, int S, int* __restrict__ map,
+                   int* __restrict__ owner, unsigned* __restrict__ ref, unsigned* __restrict__ tag,
+                   unsigned* __restrict__ state, int* __restrict__ sidx, int* __restrict__ fill) {
+  const int lane = threadIdx.x;
+  __shared__ unsigned tick;
+  if (lane == 0) tick = ++state[1];
+  __syncwarp();
+  bool miss = false;
+  if (lane < topk) {
+    const int s = map[key0 + idx[lane]];
+    if (s >= 0) {
+      ref[s] = 1u;
+      tag[s] = tick;
+      sidx[lane] = s;
+      fill[lane] = -1;
+    } else {
+      miss = true;
+    }
+  }
+  unsigned need = __ballot_sync(0xffffffffu, miss);
+  if (lane == 0) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(state + 2), (unsigned long long)(topk - __popc(need)));
+    atomicAdd(reinterpret_cast<unsigned long long*>(state + 4), (unsigned long long)__popc(need));
+  }
+  __syncwarp();
+  unsigned hand = state[0];
+  while (need) {
+    const int k = __ffs(need) - 1;
+    need &= need - 1;
+    int victim = -1;
+    while (victim < 0) {
+      const int s = (int)((hand + lane) % S);
+      const bool used = tag[s] == tick;
+      const unsigned m = __ballot_sync(0xffffffffu, !used && ref[s] == 0u);
+      const int first = m ? __ffs(m) - 1 : 32;
+      if (lane < first && !used) ref[s] = 0u;
+      __syncwarp();
+      if (m) {
+        victim = (int)((hand + first) % S);
+        hand = (unsigned)((victim + 1) % S);
+      } else {
+        hand = (hand + 32) % S;
+      }
+    }
+    if (lane == 0) {
+      const int key = key0 + idx[k];
+      const int old = owner[victim];
+      if (old >= 0) map[old] = -1;
+      owner[victim] = key;
+      map[key] = victim;
+      ref[victim] = 1u;
+      tag[victim] = tick;
+      sidx[k] = victim;
+      fill[k] = victim;
+    }
+    __syncwarp();
+  }
+  if (lane == 0) state[0] = hand;
+}
+
+API int dr_expert_slots(const int* idx, int topk, int key0, int S, int* map, int* owner, unsigned* ref, unsigned* tag,
+                        unsigned* state, int* sidx, int* fill, cudaStream_t st) {
+  if (topk > 32 || S < topk) return -1;
+  k_expert_slots<<<1, 32, 0, st>>>(idx, topk, key0, S, map, owner, ref, tag, state, sidx, fill);
+  return 0;
+}
+
+// One expert part: `n` int4 per expert, read from the source bank at expert `e`, written to the slot bank at `slot`.
+DEV void copy_part(const int4* __restrict__ src, int4* __restrict__ dst, size_t n, size_t e, size_t slot) {
+  constexpr int U = 4;
+  src += e * n;
+  dst += slot * n;
+  const size_t stride = (size_t)gridDim.x * blockDim.x;
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  for (; i + (U - 1) * stride < n; i += U * stride) {
+    int4 v[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) v[u] = src[i + u * stride];
+#pragma unroll
+    for (int u = 0; u < U; ++u) dst[i + u * stride] = v[u];
+  }
+  for (; i < n; i += stride) dst[i] = src[i];
+}
+
+// The experts k with fill[k] >= 0: expert idx[k] of the source banks into slot fill[k]. Grid (blocks, topk).
+__global__ void __launch_bounds__(256)
+    k_expert_fill(const int* __restrict__ idx, const int* __restrict__ fill, const int4* g_q, const int4* g_sm,
+                  const int4* d_q, const int4* d_sm, int4* c_gq, int4* c_gsm, int4* c_dq, int4* c_dsm, size_t n_gq,
+                  size_t n_gsm, size_t n_dq, size_t n_dsm) {
+  const int slot = fill[blockIdx.y];
+  if (slot < 0) return;
+  const size_t e = idx[blockIdx.y];
+  copy_part(g_q, c_gq, n_gq, e, slot);
+  copy_part(g_sm, c_gsm, n_gsm, e, slot);
+  copy_part(d_q, c_dq, n_dq, e, slot);
+  copy_part(d_sm, c_dsm, n_dsm, e, slot);
+}
+
+// Byte sizes are per expert and multiples of 16.
+API int dr_expert_fill(const int* idx, const int* fill, int topk, const void* g_q, const void* g_sm, const void* d_q,
+                       const void* d_sm, void* c_gq, void* c_gsm, void* c_dq, void* c_dsm, size_t b_gq, size_t b_gsm,
+                       size_t b_dq, size_t b_dsm, cudaStream_t st) {
+  if ((b_gq | b_gsm | b_dq | b_dsm) & 15) return -1;
+  k_expert_fill<<<dim3(32, topk), 256, 0, st>>>(
+      idx, fill, (const int4*)g_q, (const int4*)g_sm, (const int4*)d_q, (const int4*)d_sm, (int4*)c_gq, (int4*)c_gsm,
+      (int4*)c_dq, (int4*)c_dsm, b_gq / 16, b_gsm / 16, b_dq / 16, b_dsm / 16);
   return 0;
 }
 
@@ -1715,6 +1871,12 @@ API int dr_malloc(void** p, size_t n) { return (int)cudaMalloc(p, n); }
 API int dr_free(void* p) { return (int)cudaFree(p); }
 API int dr_host_alloc(void** p, size_t n) { return (int)cudaMallocHost(p, n); }
 API int dr_host_free(void* p) { return (int)cudaFreeHost(p); }
+// Written once by the CPU and read by the GPU only: write-combined, mapped so kernels read it over PCIe.
+API int dr_host_alloc_mapped(void** p, void** dev, size_t n) {
+  cudaError_t e = cudaHostAlloc(p, n, cudaHostAllocMapped | cudaHostAllocPortable | cudaHostAllocWriteCombined);
+  if (e != cudaSuccess) return (int)e;
+  return (int)cudaHostGetDevicePointer(dev, *p, 0);
+}
 API int dr_h2d(void* d, const void* h, size_t n, cudaStream_t st) {
   return (int)cudaMemcpyAsync(d, h, n, cudaMemcpyHostToDevice, st);
 }

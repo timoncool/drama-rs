@@ -1,7 +1,7 @@
 # drama-rs
 
 Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on a single
-24 GB GPU (RTX 4090), in Rust + CUDA. No PyTorch at runtime.
+24 GB GPU (RTX 4090), or from 8 GB with the routed experts in RAM, in Rust + CUDA. No PyTorch at runtime.
 
 - **Backbone**: Qwen3.5-MoE (35B total / 3B active, 40 layers, gated-DeltaNet linear attention
   + full attention every 4th layer). Routed experts are 4-bit, everything else 8-bit.
@@ -21,6 +21,29 @@ Fish Audio [Drama 3](https://huggingface.co/fishaudio/drama-3) text-to-speech on
 Each decode step is one CUDA-graph replay: lm_head → sampling (with RAS) → 13 tower layers
 with 9 codebook samplers → backbone step for the new frame. Weight-streaming GEMVs prefetch
 the next kernel's weights into L2 to hide launch gaps.
+
+## Smaller GPUs: routed experts in RAM
+
+`--vram-gb N` (C ABI: `drama_load_ex`) caps the VRAM the engine takes, codec included; 0 (the default) takes the
+whole model when it fits the free VRAM. When it does not fit, the 18 GB of routed experts stay in page-locked RAM
+and the rest of the limit becomes a VRAM cache of experts shared by all layers. A decode step uses 8 of a layer's
+256 experts: a kernel inside the CUDA graph looks them up (CLOCK eviction, all state on the GPU) and copies the
+missing ones from RAM over PCIe, so the step stays one graph replay. The prefill reads cached experts from their
+slots and streams the others, 64 at a time. The output is bit-identical to the experts-in-VRAM run; a smaller cache
+only means more copies.
+
+Measured on an RTX 4090 (PCIe 4.0 x16) with a cloned voice, the second and third of three sentences (the cache is
+warm), `--vram-gb` limiting the engine as a smaller card would:
+
+| `--vram-gb` | engine peak VRAM | expert cache | cache hits | speed | first audio |
+|---|---|---|---|---|---|
+| 0 (whole model) | 22.0 GiB | – | – | 6.9× real time | 160 ms |
+| 12 | 12.5 GiB | 7.4 GiB | 84% | 3.6× | 520 ms |
+| 8 | 8.3 GiB | 3.4 GiB | 60% | 2.3× | 725 ms |
+| 6 | 6.2 GiB | 1.4 GiB | 40% | 1.8× | 820 ms |
+
+RAM: the experts take 18.1 GB of page-locked memory. The first sentence after loading is slower (about 1 s to the
+first audio), as the empty cache fills.
 
 ## Quantization
 
@@ -85,6 +108,9 @@ cp models/drama-3/tokenizer.json models/drama-3-q4/
 ./target/release/drama speak --model models/drama-3-q4 --play \
   --ref-wav voice.wav --ref-text "Exactly what is said in voice.wav." \
   --text "<|speaker:0|> [sighs] Fine. If we miss it, it's on you."
+
+# on a smaller card: at most 8 GiB of VRAM, the routed experts in RAM
+./target/release/drama speak --model models/drama-3-q4 --vram-gb 8 --text "Hello there." --out hello.wav
 
 # keep the model loaded and speak every line typed on stdin
 ./target/release/drama speak --model models/drama-3-q4 --interactive --play

@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::gpu::{DevBuf, Stream};
+use crate::gpu::{DevBuf, HostBuf, Stream};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeParameters {
@@ -100,17 +100,55 @@ impl Q8 {
     }
 }
 
+/// Where the routed experts (about 80% of the weights) live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Experts {
+    /// On the GPU with the rest of the model.
+    Vram,
+    /// In page-locked RAM; decoding keeps the experts in use in a VRAM cache (`Engine`).
+    Ram,
+}
+
+pub enum Bank {
+    Dev(DevBuf),
+    Host(HostBuf),
+}
+
+impl Bank {
+    /// The address kernels read.
+    pub fn dev(&self) -> *const u8 {
+        match self {
+            Bank::Dev(b) => b.ptr::<u8>(),
+            Bank::Host(b) => b.dev::<u8>(),
+        }
+    }
+
+    /// The address a host-to-device copy reads (RAM banks only).
+    pub fn host(&self) -> Option<*const u8> {
+        match self {
+            Bank::Dev(_) => None,
+            Bank::Host(b) => Some(b.host::<u8>()),
+        }
+    }
+}
+
 /// Routed experts, int4 asymmetric with group 64: q [E, N, K/2], sm [E, N, K/64, 2].
 pub struct Q4 {
-    pub q: DevBuf,
-    pub sm: DevBuf,
+    pub q: Bank,
+    pub sm: Bank,
     pub n: usize,
     pub k: usize,
 }
 
 impl Q4 {
+    /// Bytes of one expert in q and in sm.
+    pub fn expert_bytes(&self) -> (usize, usize) {
+        (self.n * self.k / 2, self.n * (self.k / 64) * 4)
+    }
+
     pub fn expert(&self, e: usize) -> (*const u8, *const u16) {
-        (self.q.at::<u8>(e * self.n * self.k / 2), self.sm.at::<u16>(e * self.n * (self.k / 64) * 2))
+        let (bq, bs) = self.expert_bytes();
+        unsafe { (self.q.dev().add(e * bq), self.sm.dev().add(e * bs) as *const u16) }
     }
 }
 
@@ -190,6 +228,7 @@ pub struct Model {
     pub tower_inv_freq: Dense,
     /// The full token embedding stays on the host; prefill gathers its rows.
     pub embed_tokens: HostTensor,
+    pub experts: Experts,
 }
 
 pub struct HostTensor {
@@ -229,6 +268,8 @@ struct Loader<'a> {
     stream: &'a Stream,
     prefix: String,
     uploaded: &'a mut usize,
+    experts: Experts,
+    in_ram: &'a mut usize,
 }
 
 impl Loader<'_> {
@@ -261,9 +302,23 @@ impl Loader<'_> {
         Ok(Q8 { q, s, n: shape[0], k: shape[1] })
     }
 
+    fn bank(&mut self, name: &str, dtype: Dtype) -> Result<(Bank, Vec<usize>)> {
+        if self.experts == Experts::Vram {
+            let (buf, shape) = self.raw(name, dtype)?;
+            return Ok((Bank::Dev(buf), shape));
+        }
+        let t = self.st.tensor(name).map_err(|e| anyhow!("{}{name}: {e}", self.prefix))?;
+        if t.dtype() != dtype {
+            bail!("{}{name}: dtype {:?}, expected {dtype:?}", self.prefix, t.dtype());
+        }
+        let buf = HostBuf::from_bytes(t.data()).with_context(|| format!("{}{name}: page-locked RAM for the experts", self.prefix))?;
+        *self.in_ram += t.data().len();
+        Ok((Bank::Host(buf), t.shape().to_vec()))
+    }
+
     fn q4(&mut self, name: &str) -> Result<Q4> {
-        let (q, shape) = self.raw(&format!("{name}.q4"), Dtype::U8)?;
-        let (sm, _) = self.raw(&format!("{name}.sm"), Dtype::F16)?;
+        let (q, shape) = self.bank(&format!("{name}.q4"), Dtype::U8)?;
+        let (sm, _) = self.bank(&format!("{name}.sm"), Dtype::F16)?;
         Ok(Q4 { q, sm, n: shape[1], k: shape[2] * 2 })
     }
 }
@@ -273,8 +328,25 @@ fn inv_freq(theta: f64, rot: usize) -> Vec<f32> {
     (0..rot / 2).map(|i| 1.0f32 / (theta as f32).powf((2 * i) as f32 / rot as f32)).collect()
 }
 
+/// VRAM the engine needs besides the weights and the codec with `Experts::Vram`: KV caches, decode and prefill buffers,
+/// cuBLAS and the codec's working memory (measured 1.46 GiB at a 2048-row context: peak 21.83 GiB of the process).
+const RUNTIME_RESERVE: u64 = 1792 << 20;
+
+/// VRAM the whole model takes on the GPU with `Experts::Vram`, codec weights excluded.
+pub fn full_vram(dir: &Path) -> Result<u64> {
+    let mut weights = 0u64;
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let p = entry?.path();
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("layer") || name == "tower.safetensors" {
+            weights += std::fs::metadata(&p)?.len();
+        }
+    }
+    Ok(weights + RUNTIME_RESERVE)
+}
+
 impl Model {
-    pub fn load(dir: &Path, stream: &Stream) -> Result<Self> {
+    pub fn load(dir: &Path, stream: &Stream, experts: Experts) -> Result<Self> {
         let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
@@ -285,11 +357,12 @@ impl Model {
         let dc = &cfg.audio_decoder_config;
         let t0 = std::time::Instant::now();
         let mut uploaded = 0usize;
+        let mut in_ram = 0usize;
 
         let mut layers = Vec::with_capacity(tc.num_hidden_layers);
         for i in 0..tc.num_hidden_layers {
             let file = File::open(&dir.join(format!("layer{i:02}.safetensors")))?;
-            let mut l = Loader { st: file.st()?, stream, prefix: format!("layer{i:02}."), uploaded: &mut uploaded };
+            let mut l = Loader { st: file.st()?, stream, prefix: format!("layer{i:02}."), uploaded: &mut uploaded, experts, in_ram: &mut in_ram };
             let mixer = if cfg.is_linear(i) {
                 Mixer::Linear(LinearAttn {
                     in_proj: l.q8("la.in_proj")?,
@@ -327,7 +400,7 @@ impl Model {
         }
 
         let file = File::open(&dir.join("tower.safetensors"))?;
-        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded };
+        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram };
         let mut tower = Vec::new();
         for t in 0..cfg.tower_layers() {
             let p = format!("t{t}.");
@@ -354,7 +427,7 @@ impl Model {
 
         let gfile = File::open(&dir.join("globals.safetensors"))?;
         let gst = gfile.st()?;
-        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded };
+        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram };
         let lm_head_cand = l.bf16("lm_head_cand")?;
         let final_norm = l.f32("final_norm")?;
         stream.sync()?;
@@ -385,11 +458,16 @@ impl Model {
         let tower_inv_freq = Dense { buf: DevBuf::from_slice(&inv_freq(dc.rope_base, trot), stream)?, shape: vec![trot / 2] };
         stream.sync()?;
 
-        eprintln!(
-            "loaded {:.2} GB of weights in {:.1}s",
-            (uploaded + cand.len()) as f64 / 1e9,
-            t0.elapsed().as_secs_f64()
-        );
+        if in_ram > 0 {
+            eprintln!(
+                "loaded {:.2} GB of weights to the GPU and {:.2} GB of experts to RAM in {:.1}s",
+                (uploaded + cand.len()) as f64 / 1e9,
+                in_ram as f64 / 1e9,
+                t0.elapsed().as_secs_f64()
+            );
+        } else {
+            eprintln!("loaded {:.2} GB of weights in {:.1}s", (uploaded + cand.len()) as f64 / 1e9, t0.elapsed().as_secs_f64());
+        }
         Ok(Self {
             cfg,
             layers,
@@ -402,6 +480,7 @@ impl Model {
             text_inv_freq,
             tower_inv_freq,
             embed_tokens,
+            experts,
         })
     }
 }

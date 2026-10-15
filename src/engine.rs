@@ -11,12 +11,16 @@ use std::ffi::c_void;
 use anyhow::{bail, Result};
 
 use crate::ffi;
-use crate::gpu::{launched, Cublas, DevBuf, Graph, Pinned, Stream};
-use crate::model::{Dense, Mixer, Model, Q8};
+use crate::gpu::{check, launched, mem_info, Cublas, DevBuf, Graph, Pinned, Stream};
+use crate::model::{Dense, Experts, Layer, Mixer, Model, Q8};
 
 pub const RAS_WINDOW: usize = 16;
 const ROUTER_PREFETCH: bool = false;
 const GEMV_PREFETCH: bool = true;
+/// Routed experts a prefill copies to the GPU at a time when they live in RAM.
+const PF_EXPERTS: usize = 64;
+/// Smallest expert cache worth running: below it nearly every expert read is a miss.
+const MIN_SLOTS: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +104,28 @@ struct PrefillBufs {
     wbuf: DevBuf,
 }
 
+/// VRAM slots for routed experts that live in RAM, shared by all layers (see `dr_expert_slots`). A slot holds one
+/// expert's four parts at the same offsets as an expert bank, so the decode kernels read slots like experts.
+struct ExpertCache {
+    slots: usize,
+    /// gate_up q, gate_up sm, down q, down sm: [slots][bytes]
+    banks: [DevBuf; 4],
+    bytes: [usize; 4],
+    map: DevBuf,
+    owner: DevBuf,
+    refb: DevBuf,
+    tag: DevBuf,
+    state: DevBuf,
+    sidx: DevBuf,
+    fill: DevBuf,
+    /// The prefill's experts that are not in the cache, PF_EXPERTS at a time.
+    stage: [DevBuf; 4],
+    /// [num_experts] i32: where a prefill pass reads each expert (see `pf_expert` in drama.cu).
+    pf_where: DevBuf,
+    /// The first prefill fills the empty cache with the experts its prompt used most.
+    seeded: bool,
+}
+
 pub struct Engine {
     pub model: Model,
     st: Stream,
@@ -122,6 +148,7 @@ pub struct Engine {
     dec: DecodeBufs,
     pre: PrefillBufs,
     graph: Option<Graph>,
+    cache: Option<ExpertCache>,
     frame_host: Pinned<i32>,
     pub trace_logits: bool,
     /// Set from any thread to end the running `generate` at its next frame with [`Cancelled`].
@@ -177,8 +204,73 @@ fn i(b: &DevBuf) -> *mut i32 {
     b.ptr::<i32>()
 }
 
+impl ExpertCache {
+    /// Takes the VRAM free now less `keep_free`.
+    fn new(model: &Model, keep_free: usize, st: &Stream) -> Result<Self> {
+        let tc = &model.cfg.text_config;
+        let l0 = &model.layers[0];
+        let (gq, gs) = l0.gate_up.expert_bytes();
+        let (dq, ds) = l0.down.expert_bytes();
+        let bytes = [gq, gs, dq, ds];
+        let per: usize = bytes.iter().sum();
+        let stage = [
+            DevBuf::alloc(PF_EXPERTS * gq)?,
+            DevBuf::alloc(PF_EXPERTS * gs)?,
+            DevBuf::alloc(PF_EXPERTS * dq)?,
+            DevBuf::alloc(PF_EXPERTS * ds)?,
+        ];
+        let total = tc.num_hidden_layers * tc.num_experts;
+        let (free, _) = mem_info()?;
+        let slots = (free.saturating_sub(keep_free) / per).min(total);
+        if slots < MIN_SLOTS {
+            bail!(
+                "not enough VRAM for the expert cache: {:.2} GiB free, {:.2} GiB to keep free, at least {:.2} GiB needed",
+                free as f64 / (1u64 << 30) as f64,
+                keep_free as f64 / (1u64 << 30) as f64,
+                (keep_free + MIN_SLOTS * per) as f64 / (1u64 << 30) as f64
+            );
+        }
+        let banks = [DevBuf::alloc(slots * gq)?, DevBuf::alloc(slots * gs)?, DevBuf::alloc(slots * dq)?, DevBuf::alloc(slots * ds)?];
+        let topk = tc.num_experts_per_tok;
+        let cache = Self {
+            slots,
+            banks,
+            bytes,
+            map: DevBuf::alloc(total * I32)?,
+            owner: DevBuf::alloc(slots * I32)?,
+            refb: DevBuf::zeros(slots * 4, st)?,
+            tag: DevBuf::zeros(slots * 4, st)?,
+            state: DevBuf::zeros(8 * 4, st)?,
+            sidx: DevBuf::alloc(topk * I32)?,
+            fill: DevBuf::alloc(topk * I32)?,
+            stage,
+            pf_where: DevBuf::alloc(tc.num_experts * I32)?,
+            seeded: false,
+        };
+        cache.map.fill_bytes(0xff, st)?;
+        cache.owner.fill_bytes(0xff, st)?;
+        eprintln!(
+            "expert cache: {slots} of {total} experts ({:.2} GiB of VRAM)",
+            (slots * per) as f64 / (1u64 << 30) as f64
+        );
+        Ok(cache)
+    }
+}
+
+/// Bank part `p` of an expert bank as (device address for kernels, host address for copies).
+fn part(layer: &Layer, p: usize) -> (*const u8, Option<*const u8>) {
+    let bank = match p {
+        0 => &layer.gate_up.q,
+        1 => &layer.gate_up.sm,
+        2 => &layer.down.q,
+        _ => &layer.down.sm,
+    };
+    (bank.dev(), bank.host())
+}
+
 impl Engine {
-    pub fn new(model: Model, max_len: usize, chunk: usize) -> Result<Self> {
+    /// `keep_free`: with the experts in RAM, the expert cache takes the VRAM free after the engine's buffers less this.
+    pub fn new(model: Model, max_len: usize, chunk: usize, keep_free: usize) -> Result<Self> {
         let st = Stream::new()?;
         let blas = Cublas::new(&st)?;
         launched(unsafe { ffi::dr_sample_init() }, "sample init")?;
@@ -318,6 +410,8 @@ impl Engine {
             wbuf: DevBuf::alloc(wmax * BF16)?,
         };
 
+        let cache = if model.experts == Experts::Ram { Some(ExpertCache::new(&model, keep_free, &st)?) } else { None };
+
         let mut engine = Self {
             st,
             blas,
@@ -339,6 +433,7 @@ impl Engine {
             dec,
             pre,
             graph: None,
+            cache,
             frame_host: Pinned::new(width)?,
             trace_logits: false,
             stop: Default::default(),
@@ -393,6 +488,9 @@ impl Engine {
             let n = (rows - start).min(self.chunk);
             self.prefill_chunk(&d_frames, frames, start, n, rows)?;
             start += n;
+        }
+        if let Some(c) = self.cache.as_mut() {
+            c.seeded = true;
         }
 
         // Decode state: hidden of the last row, its frame, the RAS window.
@@ -512,7 +610,7 @@ impl Engine {
             }
             // MoE
             self.rmsnorm(f(&p.x), &layer.post_norm, std::ptr::null_mut(), h(&p.hn_b), n, eps)?;
-            self.moe_prefill(layer, n)?;
+            self.moe_prefill(li, layer, n, start == 0)?;
         }
         self.rmsnorm(f(&p.x), &self.model.final_norm, f(&p.h_all), std::ptr::null_mut(), n, eps)?;
 
@@ -556,7 +654,7 @@ impl Engine {
         self.gemm_q8(h(&p.o_b), o_w, resid, n, 1.0)
     }
 
-    fn moe_prefill(&self, layer: &crate::model::Layer, n: usize) -> Result<()> {
+    fn moe_prefill(&self, li: usize, layer: &Layer, n: usize, first_chunk: bool) -> Result<()> {
         let tc = &self.model.cfg.text_config;
         let p = &self.pre;
         let s = self.s();
@@ -594,20 +692,129 @@ impl Engine {
             },
             "moe_permute",
         )?;
-        let (gq, gs) = layer.gate_up.expert(0);
-        let (dq, ds) = layer.down.expert(0);
-        launched(
-            unsafe {
-                ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
-            },
-            "moe_prefill",
-        )?;
+        if let Some(c) = &self.cache {
+            self.moe_prefill_ram(c, li, layer, &counts, first_chunk && !c.seeded)?;
+        } else {
+            let (gq, gs) = layer.gate_up.expert(0);
+            let (dq, ds) = layer.down.expert(0);
+            launched(
+                unsafe {
+                    ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                },
+                "moe_prefill",
+            )?;
+        }
         launched(
             unsafe {
                 ffi::dr_moe_combine(f(&p.x), f(&p.yp), i(&p.slot_of), f(&p.wts), f(&p.sgate), f(&p.sh_out), n as i32, topk as i32, d as i32, s)
             },
             "moe_combine",
         )
+    }
+
+    /// The grouped expert pass with the experts in RAM. One pass reads the experts that are in the VRAM cache from their
+    /// slots; the others go to the stage over PCIe, PF_EXPERTS at a time, each run of consecutive experts in one copy.
+    /// `seed`: also give the layer's most used experts of this prompt an equal share of the (empty) cache.
+    fn moe_prefill_ram(&self, c: &ExpertCache, li: usize, layer: &Layer, counts: &[i32], seed: bool) -> Result<()> {
+        let tc = &self.model.cfg.text_config;
+        let p = &self.pre;
+        let s = self.s();
+        let e = tc.num_experts;
+        let (d, mi) = (tc.hidden_size, tc.moe_intermediate_size);
+        let mut map: Vec<i32> = c.map.download_at(li * e * I32, e, &self.st)?;
+        let run = |where_: &[i32]| -> Result<()> {
+            c.pf_where.upload_at(0, where_, &self.st)?;
+            launched(
+                unsafe {
+                    ffi::dr_moe_prefill_where(
+                        c.banks[0].ptr::<u8>(),
+                        c.banks[1].ptr::<u16>(),
+                        c.banks[2].ptr::<u8>(),
+                        c.banks[3].ptr::<u16>(),
+                        c.stage[0].ptr::<u8>(),
+                        c.stage[1].ptr::<u16>(),
+                        c.stage[2].ptr::<u8>(),
+                        c.stage[3].ptr::<u16>(),
+                        i(&c.pf_where),
+                        h(&p.xp),
+                        i(&p.offsets),
+                        i(&p.counts),
+                        h(&p.ap),
+                        f(&p.yp),
+                        e as i32,
+                        d as i32,
+                        mi as i32,
+                        s,
+                    )
+                },
+                "moe_prefill",
+            )
+        };
+
+        let used = |x: usize| counts[x] > 0;
+        if (0..e).any(|x| used(x) && map[x] >= 0) {
+            let where_: Vec<i32> = (0..e).map(|x| if used(x) && map[x] >= 0 { map[x] } else { -1 }).collect();
+            run(&where_)?;
+        }
+
+        let missing: Vec<usize> = (0..e).filter(|&x| used(x) && map[x] < 0).collect();
+        let share = c.slots / tc.num_hidden_layers;
+        let mut seeds: Vec<(usize, usize)> = Vec::new();
+        if seed {
+            let mut by_use = missing.clone();
+            by_use.sort_by_key(|&x| std::cmp::Reverse(counts[x]));
+            seeds = by_use.into_iter().take(share).enumerate().map(|(r, x)| (x, li * share + r)).collect();
+        }
+        for batch in missing.chunks(PF_EXPERTS) {
+            let mut k = 0;
+            while k < batch.len() {
+                let mut n = 1;
+                while k + n < batch.len() && batch[k + n] == batch[k] + n {
+                    n += 1;
+                }
+                for (q, &b) in c.bytes.iter().enumerate() {
+                    let host = part(layer, q).1.expect("experts in RAM");
+                    check(
+                        unsafe { ffi::dr_h2d(c.stage[q].at::<u8>(k * b) as *mut c_void, host.add(batch[k] * b) as *const c_void, n * b, s) },
+                        "expert copy",
+                    )?;
+                }
+                k += n;
+            }
+            let mut where_ = vec![-1i32; e];
+            for (k, &x) in batch.iter().enumerate() {
+                where_[x] = -(k as i32) - 2;
+            }
+            run(&where_)?;
+            for &(x, slot) in seeds.iter() {
+                if let Some(k) = batch.iter().position(|&y| y == x) {
+                    for (q, &b) in c.bytes.iter().enumerate() {
+                        check(
+                            unsafe { ffi::dr_d2d(c.banks[q].at::<u8>(slot * b) as *mut c_void, c.stage[q].at::<u8>(k * b) as *const c_void, b, s) },
+                            "expert copy",
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if !seeds.is_empty() {
+            let mut owner = Vec::with_capacity(seeds.len());
+            for &(x, slot) in &seeds {
+                map[x] = slot as i32;
+                owner.push((li * e + x) as i32);
+            }
+            c.map.upload_at(li * e * I32, &map, &self.st)?;
+            c.owner.upload_at(seeds[0].1 * I32, &owner, &self.st)?;
+        }
+        Ok(())
+    }
+
+    /// Expert reads that found their expert in the VRAM cache, and those that copied it from RAM, since loading.
+    pub fn cache_stats(&self) -> Result<Option<(u64, u64)>> {
+        let Some(c) = &self.cache else { return Ok(None) };
+        let v: Vec<u64> = c.state.download_at(8, 2, &self.st)?;
+        Ok(Some((v[0], v[1])))
     }
 
     /// Teacher-forced tower over prompt rows [start, start + m): each row's labels are the
@@ -952,8 +1159,16 @@ impl Engine {
             }
             let e = tc.num_experts;
             let topk = tc.num_experts_per_tok;
-            let (gq, gs) = layer.gate_up.expert(0);
-            let (dq, ds) = layer.down.expert(0);
+            let cache = self.cache.as_ref();
+            // with the experts in RAM the kernels read the cache slots, addressed by slot ids
+            let ((gq, gs), (dq, ds), moe_idx) = match cache {
+                Some(c) => (
+                    (c.banks[0].ptr::<u8>() as *const u8, c.banks[1].ptr::<u16>() as *const u16),
+                    (c.banks[2].ptr::<u8>() as *const u8, c.banks[3].ptr::<u16>() as *const u16),
+                    i(&c.sidx),
+                ),
+                None => (layer.gate_up.expert(0), layer.down.expert(0), i(&b.idx)),
+            };
             let (gu, dn) = (&layer.gate_up, &layer.down);
             let router = &layer.router;
             let post = &layer.post_norm;
@@ -974,7 +1189,7 @@ impl Engine {
                             f(&b.wts),
                             f(&b.sgate),
                             b.counter.ptr::<u32>(),
-                            if ROUTER_PREFETCH { gq as *const std::ffi::c_char } else { std::ptr::null() },
+                            if ROUTER_PREFETCH && cache.is_none() { gq as *const std::ffi::c_char } else { std::ptr::null() },
                             gs as *const std::ffi::c_char,
                             dq as *const std::ffi::c_char,
                             ds as *const std::ffi::c_char,
@@ -988,6 +1203,54 @@ impl Engine {
                     "router_topk",
                 )
             }));
+            if let Some(c) = cache {
+                let src: Vec<*const u8> = (0..4).map(|q| part(layer, q).0).collect();
+                let key0 = (li * e) as i32;
+                ops.push(Op::plain(move |_, _| {
+                    launched(
+                        unsafe {
+                            ffi::dr_expert_slots(
+                                i(&b.idx),
+                                topk as i32,
+                                key0,
+                                c.slots as i32,
+                                i(&c.map),
+                                i(&c.owner),
+                                c.refb.ptr::<u32>(),
+                                c.tag.ptr::<u32>(),
+                                c.state.ptr::<u32>(),
+                                i(&c.sidx),
+                                i(&c.fill),
+                                s,
+                            )
+                        },
+                        "expert_slots",
+                    )?;
+                    launched(
+                        unsafe {
+                            ffi::dr_expert_fill(
+                                i(&b.idx),
+                                i(&c.fill),
+                                topk as i32,
+                                src[0] as *const c_void,
+                                src[1] as *const c_void,
+                                src[2] as *const c_void,
+                                src[3] as *const c_void,
+                                c.banks[0].ptr(),
+                                c.banks[1].ptr(),
+                                c.banks[2].ptr(),
+                                c.banks[3].ptr(),
+                                c.bytes[0],
+                                c.bytes[1],
+                                c.bytes[2],
+                                c.bytes[3],
+                                s,
+                            )
+                        },
+                        "expert_fill",
+                    )
+                }));
+            }
             let (sgq, sgs) = layer.shared_gate_up.rows(0);
             let (sdq, sds) = layer.shared_down.rows(0);
             let mi = tc.moe_intermediate_size;
@@ -1004,7 +1267,7 @@ impl Engine {
                             sdq,
                             sds,
                             f(&b.x),
-                            i(&b.idx),
+                            moe_idx,
                             f(&b.wts),
                             f(&b.sgate),
                             f(&b.x),

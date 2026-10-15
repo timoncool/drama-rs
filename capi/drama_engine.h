@@ -24,8 +24,17 @@ const char *drama_version(void);
 uint32_t drama_sample_rate(void);
 /* The last error of this thread, valid until its next call into the engine. */
 const char *drama_last_error(void);
-/* Weights folder (apiplant/drama-q4 layout); NULL on error. */
+/* Weights folder (apiplant/drama-q4 layout); NULL on error. Same as drama_load_ex with no VRAM limit. */
 DramaEngine *drama_load(const char *model_dir, uint32_t max_len, uint32_t prefill_chunk);
+/* vram_limit_mb: most VRAM the engine takes, 0 = what is free less 1 GB. When the whole model does not fit, the
+ * routed experts (18 GB of the 21 GB of weights) stay in page-locked RAM and a VRAM cache of the ones in use takes the
+ * rest of the limit: the output is the same, less VRAM only decodes slower. */
+DramaEngine *drama_load_ex(const char *model_dir, uint32_t max_len, uint32_t prefill_chunk, uint32_t vram_limit_mb);
+#define DRAMA_EXPERTS_VRAM 1
+#define DRAMA_EXPERTS_RAM 2
+/* Where the experts live (DRAMA_EXPERTS_VRAM or _RAM) and, in RAM, the cache's expert reads since loading that
+ * hit and that were copied from RAM. Any output may be NULL. */
+int32_t drama_experts(DramaEngine *engine, uint32_t *out_experts, uint64_t *out_hits, uint64_t *out_misses);
 void drama_free(DramaEngine *engine);
 /* Speaks `text` in the voice of `ref_wav` (any rate, its exact transcript in `ref_text`). The reference is
  * encoded once per (path, transcript, size, modified time) and kept. On DRAMA_OK *out_audio holds *out_len

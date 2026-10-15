@@ -102,6 +102,11 @@ impl DevBuf {
         check(unsafe { ffi::dr_memset(self.ptr, 0, self.bytes, st.raw) }, "memset")
     }
 
+    /// Every byte set to `v` (0xff makes every i32 -1).
+    pub fn fill_bytes(&self, v: u8, st: &Stream) -> Result<()> {
+        check(unsafe { ffi::dr_memset(self.ptr, v as i32, self.bytes, st.raw) }, "memset")
+    }
+
     pub fn ptr<T>(&self) -> *mut T {
         self.ptr as *mut T
     }
@@ -221,5 +226,44 @@ impl<T: Copy> Pinned<T> {
 impl<T: Copy> Drop for Pinned<T> {
     fn drop(&mut self) {
         unsafe { ffi::dr_host_free(self.ptr as *mut c_void) };
+    }
+}
+
+/// Page-locked, write-combined host memory that kernels read directly over PCIe. The CPU writes it once and never
+/// reads it back (reads of write-combined memory are uncached and slow).
+pub struct HostBuf {
+    host: *mut c_void,
+    dev: *mut c_void,
+    bytes: usize,
+}
+
+unsafe impl Send for HostBuf {}
+
+impl HostBuf {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let (mut host, mut dev) = (std::ptr::null_mut(), std::ptr::null_mut());
+        check(unsafe { ffi::dr_host_alloc_mapped(&mut host, &mut dev, data.len().max(256)) }, &format!("cudaHostAlloc({})", data.len()))?;
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), host as *mut u8, data.len()) };
+        Ok(Self { host, dev, bytes: data.len() })
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The address kernels use.
+    pub fn dev<T>(&self) -> *mut T {
+        self.dev as *mut T
+    }
+
+    /// The address host-to-device copies use.
+    pub fn host<T>(&self) -> *const T {
+        self.host as *const T
+    }
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        unsafe { ffi::dr_host_free(self.host) };
     }
 }
