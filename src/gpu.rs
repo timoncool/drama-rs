@@ -240,13 +240,9 @@ pub struct HostBuf {
 unsafe impl Send for HostBuf {}
 
 impl HostBuf {
-    /// `write_combined`: only the GPU reads it (CPU reads of write-combined memory are uncached and slow).
-    pub fn from_bytes(data: &[u8], write_combined: bool) -> Result<Self> {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let (mut host, mut dev) = (std::ptr::null_mut(), std::ptr::null_mut());
-        check(
-            unsafe { ffi::dr_host_alloc_mapped(&mut host, &mut dev, data.len().max(256), write_combined as i32) },
-            &format!("cudaHostAlloc({})", data.len()),
-        )?;
+        check(unsafe { ffi::dr_host_alloc_mapped(&mut host, &mut dev, data.len().max(256)) }, &format!("cudaHostAlloc({})", data.len()))?;
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), host as *mut u8, data.len()) };
         Ok(Self { host, dev, bytes: data.len() })
     }
@@ -269,29 +265,5 @@ impl HostBuf {
 impl Drop for HostBuf {
     fn drop(&mut self) {
         unsafe { ffi::dr_host_free(self.host) };
-    }
-}
-
-/// A CUDA event for ordering work between streams (no timing).
-pub struct Event {
-    pub raw: *mut c_void,
-}
-
-unsafe impl Send for Event {}
-
-impl Event {
-    pub fn new() -> Result<Self> {
-        let mut raw = std::ptr::null_mut();
-        check(unsafe { ffi::dr_event_create(&mut raw) }, "cudaEventCreate")?;
-        Ok(Self { raw })
-    }
-
-    pub fn record(&self, st: &Stream) -> Result<()> {
-        check(unsafe { ffi::dr_event_record(self.raw, st.raw) }, "cudaEventRecord")
-    }
-
-    /// `st` waits for the work recorded before this event.
-    pub fn wait(&self, st: &Stream) -> Result<()> {
-        check(unsafe { ffi::dr_stream_wait(st.raw, self.raw) }, "cudaStreamWaitEvent")
     }
 }

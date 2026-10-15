@@ -281,7 +281,6 @@ struct Loader<'a> {
     uploaded: &'a mut usize,
     experts: Experts,
     in_ram: &'a mut usize,
-    write_combined: bool,
     map: Option<std::sync::Arc<Mmap>>,
     /// Bytes of experts that may still be page-locked; past it they stay in the mapped file.
     pin_left: &'a mut usize,
@@ -330,7 +329,7 @@ impl Loader<'_> {
         let len = t.data().len();
         if len <= *self.pin_left {
             // the driver may refuse before our cap (Windows limits page-locked memory per process): the rest stays mapped
-            if let Ok(buf) = HostBuf::from_bytes(t.data(), self.write_combined) {
+            if let Ok(buf) = HostBuf::from_bytes(t.data()) {
                 *self.pin_left -= len;
                 *self.in_ram += len;
                 return Ok((Bank::Host(buf), t.shape().to_vec()));
@@ -414,9 +413,7 @@ pub fn full_vram(dir: &Path) -> Result<u64> {
 }
 
 impl Model {
-    /// `cpu_reads`: with `Experts::Ram`, the CPU also reads the experts (computes some of them), so they are not
-    /// write-combined.
-    pub fn load(dir: &Path, stream: &Stream, experts: Experts, cpu_reads: bool) -> Result<Self> {
+    pub fn load(dir: &Path, stream: &Stream, experts: Experts) -> Result<Self> {
         let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
@@ -441,7 +438,6 @@ impl Model {
                 uploaded: &mut uploaded,
                 experts,
                 in_ram: &mut in_ram,
-                write_combined: !cpu_reads,
                 map: Some(file.map.clone()),
                 pin_left: &mut pin_left,
                 in_file: &mut in_file,
@@ -483,7 +479,7 @@ impl Model {
         }
 
         let file = File::open(&dir.join("tower.safetensors"))?;
-        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, write_combined: true, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
+        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let mut tower = Vec::new();
         for t in 0..cfg.tower_layers() {
             let p = format!("t{t}.");
@@ -510,7 +506,7 @@ impl Model {
 
         let gfile = File::open(&dir.join("globals.safetensors"))?;
         let gst = gfile.st()?;
-        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, write_combined: true, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
+        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let lm_head_cand = l.bf16("lm_head_cand")?;
         let final_norm = l.f32("final_norm")?;
         stream.sync()?;
