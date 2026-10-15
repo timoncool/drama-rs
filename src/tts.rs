@@ -186,7 +186,7 @@ impl Tts {
                 let mut voices: Vec<Reference> = refs.to_vec();
                 let mut voiced: Vec<u32> = covered;
                 for (i, seg) in segments.iter().enumerate() {
-                    let rows = prompt::build_prompt_rows(seg, &voices, tok, ncb, cb)?;
+                    let (rows, voice_rows) = prompt::build_prompt(seg, &voices, tok, ncb, cb)?;
                     prompt_rows += rows.len() / width;
                     if i == 0 {
                         first_prompt = rows.clone();
@@ -199,7 +199,7 @@ impl Tts {
                     for attempt in 0..=STALL_RETRIES {
                         let mut params = opts.params;
                         params.seed = params.seed.wrapping_add(i as u64).wrapping_add(attempt as u64 * 1000);
-                        seg_frames = engine.generate(&rows, params, opts.max_new.min(cap), |frame| {
+                        seg_frames = engine.generate(&rows, voice_rows, params, opts.max_new.min(cap), |frame| {
                             if opts.keep_stalled {
                                 let _ = tx.send(frame[1..].to_vec());
                             }

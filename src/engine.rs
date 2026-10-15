@@ -126,6 +126,17 @@ struct ExpertCache {
     seeded: bool,
 }
 
+/// The engine state after a prompt's voice part (everything before the text being said): the full-attention and
+/// tower KV caches up to that row, and the DeltaNet conv and recurrent states at it. A later prompt with the same
+/// voice part (and the same first text row, which the tower's last voice row reads) starts from here.
+struct VoiceSnap {
+    key: Option<u64>,
+    kv: Vec<Option<(DevBuf, DevBuf)>>,
+    conv: Vec<Option<DevBuf>>,
+    rec: Vec<Option<DevBuf>>,
+    tkv: Vec<(DevBuf, DevBuf)>,
+}
+
 pub struct Engine {
     pub model: Model,
     st: Stream,
@@ -149,6 +160,9 @@ pub struct Engine {
     pre: PrefillBufs,
     graph: Option<Graph>,
     cache: Option<ExpertCache>,
+    voice: VoiceSnap,
+    /// Prompts with a known voice part start from its saved state (see `VoiceSnap`).
+    pub reuse_voice: bool,
     frame_host: Pinned<i32>,
     pub trace_logits: bool,
     /// Set from any thread to end the running `generate` at its next frame with [`Cancelled`].
@@ -410,6 +424,13 @@ impl Engine {
             wbuf: DevBuf::alloc(wmax * BF16)?,
         };
 
+        let voice = VoiceSnap {
+            key: None,
+            kv: kv.iter().map(|k| k.as_ref().map(|(a, b)| Ok::<_, anyhow::Error>((DevBuf::alloc(a.bytes())?, DevBuf::alloc(b.bytes())?))).transpose()).collect::<Result<_>>()?,
+            conv: conv_state.iter().map(|c| c.as_ref().map(|c| DevBuf::alloc(c.bytes())).transpose()).collect::<Result<_>>()?,
+            rec: rec_state.iter().map(|c| c.as_ref().map(|c| DevBuf::alloc(c.bytes())).transpose()).collect::<Result<_>>()?,
+            tkv: tkv.iter().map(|(a, b)| Ok((DevBuf::alloc(a.bytes())?, DevBuf::alloc(b.bytes())?))).collect::<Result<_>>()?,
+        };
         let cache = if model.experts == Experts::Ram { Some(ExpertCache::new(&model, keep_free, &st)?) } else { None };
 
         let mut engine = Self {
@@ -434,6 +455,8 @@ impl Engine {
             pre,
             graph: None,
             cache,
+            voice,
+            reuse_voice: true,
             frame_host: Pinned::new(width)?,
             trace_logits: false,
             stop: Default::default(),
@@ -467,8 +490,39 @@ impl Engine {
 
     // ------------------------------------------------------------------------------ prefill
 
-    /// Run the prompt rows ([rows, width] row-major) and leave the engine ready to decode.
-    pub fn prefill(&mut self, frames: &[i32], params: SampleParams) -> Result<()> {
+    /// Copies rows [0, rows) of the KV caches and the whole DeltaNet states between the live engine and the voice
+    /// snapshot (`save`: live to snapshot).
+    fn voice_copy(&self, rows: usize, save: bool) -> Result<()> {
+        let cfg = &self.model.cfg;
+        let kv_row = cfg.text_config.num_key_value_heads * cfg.text_config.head_dim * BF16;
+        let tkv_row = cfg.audio_decoder_config.n_local_heads * cfg.audio_decoder_config.head_dim * BF16;
+        let s = self.s();
+        let copy = |live: &DevBuf, snap: &DevBuf, bytes: usize| {
+            let (dst, src) = if save { (snap, live) } else { (live, snap) };
+            check(unsafe { ffi::dr_d2d(dst.ptr::<c_void>(), src.ptr::<c_void>() as *const c_void, bytes, s) }, "voice state copy")
+        };
+        for (live, snap) in self.kv.iter().zip(&self.voice.kv) {
+            if let (Some((lk, lv)), Some((sk, sv))) = (live, snap) {
+                copy(lk, sk, rows * kv_row)?;
+                copy(lv, sv, rows * kv_row)?;
+            }
+        }
+        for (live, snap) in self.conv_state.iter().zip(&self.voice.conv).chain(self.rec_state.iter().zip(&self.voice.rec)) {
+            if let (Some(l), Some(sn)) = (live, snap) {
+                copy(l, sn, l.bytes())?;
+            }
+        }
+        for ((lk, lv), (sk, sv)) in self.tkv.iter().zip(&self.voice.tkv) {
+            copy(lk, sk, rows * tkv_row)?;
+            copy(lv, sv, rows * tkv_row)?;
+        }
+        Ok(())
+    }
+
+    /// Run the prompt rows ([rows, width] row-major) and leave the engine ready to decode. `voice_rows`: rows of the
+    /// prompt's voice part (0: none); the prefill cuts its chunks there, saves the state at that row and, with
+    /// `reuse_voice`, starts a prompt whose voice part is the saved one from that state.
+    pub fn prefill(&mut self, frames: &[i32], params: SampleParams, voice_rows: usize) -> Result<()> {
         let cfg = self.model.cfg.clone();
         let width = cfg.frame_width();
         let rows = frames.len() / width;
@@ -482,12 +536,29 @@ impl Engine {
         for s in self.conv_state.iter().chain(self.rec_state.iter()).flatten() {
             s.zero(&self.st)?;
         }
+        let voice_rows = if voice_rows > 0 && voice_rows < rows - 1 { voice_rows } else { 0 };
+        let key = (voice_rows > 0).then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            frames[..(voice_rows + 1) * width].hash(&mut h);
+            h.finish()
+        });
         let d_frames = DevBuf::from_slice(frames, &self.st)?;
         let mut start = 0;
+        if self.reuse_voice && key.is_some() && key == self.voice.key {
+            self.voice_copy(voice_rows, false)?;
+            start = voice_rows;
+        }
+        let mut last_start = start;
         while start < rows {
-            let n = (rows - start).min(self.chunk);
-            self.prefill_chunk(&d_frames, frames, start, n, rows)?;
-            start += n;
+            let end = if start < voice_rows { voice_rows.min(start + self.chunk) } else { rows.min(start + self.chunk) };
+            self.prefill_chunk(&d_frames, frames, start, end - start, rows)?;
+            last_start = start;
+            start = end;
+            if start == voice_rows && key.is_some() && key != self.voice.key {
+                self.voice_copy(voice_rows, true)?;
+                self.voice.key = key;
+            }
         }
         if let Some(c) = self.cache.as_mut() {
             c.seeded = true;
@@ -495,7 +566,7 @@ impl Engine {
 
         // Decode state: hidden of the last row, its frame, the RAS window.
         let d = cfg.text_config.hidden_size;
-        let last = (rows - 1 - (rows - 1) / self.chunk * self.chunk) * d;
+        let last = (rows - 1 - last_start) * d;
         unsafe {
             ffi::dr_d2d(f(&self.dec.x) as *mut c_void, self.pre.x.at::<f32>(last) as *const c_void, d * F32, self.s());
         }
@@ -1314,11 +1385,11 @@ impl Engine {
 
     /// Generate frames until end-of-speech or `max_new` frames.
     pub fn generate(
-        &mut self, prompt: &[i32], params: SampleParams, max_new: usize, mut on_frame: impl FnMut(&[i32]),
+        &mut self, prompt: &[i32], voice_rows: usize, params: SampleParams, max_new: usize, mut on_frame: impl FnMut(&[i32]),
     ) -> Result<Vec<Vec<i32>>> {
         let width = self.model.cfg.frame_width();
         let rows = prompt.len() / width;
-        self.prefill(prompt, params)?;
+        self.prefill(prompt, params, voice_rows)?;
         let room = self.max_len - rows;
         let mut out = Vec::new();
         for _ in 0..max_new.min(room) {

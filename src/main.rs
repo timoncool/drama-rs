@@ -39,6 +39,9 @@ struct Common {
     /// stay in RAM and a VRAM cache of the ones in use takes the rest of the limit: less VRAM, slower decoding.
     #[arg(long, default_value_t = 0.0)]
     vram_gb: f64,
+    /// Prefill every prompt whole instead of starting from the saved state of its voice part (A/B tests)
+    #[arg(long)]
+    no_voice_reuse: bool,
 }
 
 impl Common {
@@ -173,6 +176,7 @@ fn main() -> Result<()> {
             }
             let t_load = Instant::now();
             let mut tts = tts::Tts::load_with(&common.model, common.max_len, common.chunk, common.vram_limit())?;
+            tts.engine.reuse_voice = !common.no_voice_reuse;
             let (free, total) = gpu::mem_info()?;
             eprintln!(
                 "ready in {:.1}s, GPU memory {:.2} / {:.2} GiB",
@@ -264,7 +268,7 @@ fn main() -> Result<()> {
             let mut engine = common.engine()?;
             engine.trace_logits = true;
             let prompt = read_i32(&rows)?;
-            engine.prefill(&prompt, common.params())?;
+            engine.prefill(&prompt, common.params(), 0)?;
             let mut f = std::io::BufWriter::new(std::fs::File::create(&out)?);
             for _ in 0..steps {
                 let (frame, trace) = engine.step()?;
@@ -284,7 +288,7 @@ fn main() -> Result<()> {
                 rows[r * width] = 1000 + r as i32;
             }
             let t0 = Instant::now();
-            engine.prefill(&rows, common.params())?;
+            engine.prefill(&rows, common.params(), 0)?;
             eprintln!("prefill {prompt_rows} rows: {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
             for _ in 0..5 {
                 engine.step()?;

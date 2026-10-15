@@ -62,6 +62,12 @@ fn with_speaker_tag(text: &str) -> String {
 
 /// Encode text and references as [rows][1 + num_codebooks] frames, ending in the voice turn.
 pub fn build_prompt_rows(text: &str, references: &[Reference], tok: &Tokenizer, num_codebooks: usize, codebook_size: usize) -> Result<Vec<i32>> {
+    Ok(build_prompt(text, references, tok, num_codebooks, codebook_size)?.0)
+}
+
+/// As `build_prompt_rows`, with the number of rows before the text: the voice part, the same for every text spoken
+/// with these references.
+pub fn build_prompt(text: &str, references: &[Reference], tok: &Tokenizer, num_codebooks: usize, codebook_size: usize) -> Result<(Vec<i32>, usize)> {
     let sem0 = tok.token_to_id("<|semantic:0|>").ok_or_else(|| anyhow!("tokenizer has no <|semantic:0|>"))? as i32;
     let width = num_codebooks + 1;
     let mut rows: Vec<i32> = Vec::new();
@@ -102,11 +108,12 @@ pub fn build_prompt_rows(text: &str, references: &[Reference], tok: &Tokenizer, 
     validate(text, "input")?;
     push_text(MESSAGE_END, &mut rows)?;
     push_text("<|im_start|>user\n", &mut rows)?;
+    let voice_rows = rows.len() / width;
     push_text(&with_speaker_tag(text), &mut rows)?;
     push_text(MESSAGE_END, &mut rows)?;
     push_text(GENERATION_START, &mut rows)?;
     debug_assert_eq!(rows.len() % width, 0);
-    Ok(rows)
+    Ok((rows, voice_rows))
 }
 
 /// The leading `<|speaker:N|>` of `text` (after white space), if any.
