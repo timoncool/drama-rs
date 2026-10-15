@@ -16,6 +16,7 @@
 //! ```
 
 pub mod codec;
+pub mod cpu_moe;
 pub mod engine;
 pub mod ffi;
 pub mod gpu;

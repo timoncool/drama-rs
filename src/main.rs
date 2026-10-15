@@ -42,17 +42,49 @@ struct Common {
     /// Prefill every prompt whole instead of starting from the saved state of its voice part (A/B tests)
     #[arg(long)]
     no_voice_reuse: bool,
+    /// Experts in RAM: the reference count a cache hit raises a slot to (1 = CLOCK, more weighs frequency)
+    #[arg(long, default_value_t = 1)]
+    max_ref: u32,
+    /// Experts in RAM, with --max-ref > 1: a use adds 1 + routing weight * this (0: adds 1)
+    #[arg(long, default_value_t = 0.0)]
+    score_ref: f32,
+    /// Experts in RAM: copy the next layer's predicted experts while the current layer computes
+    #[arg(long)]
+    prefetch: bool,
+    /// Experts in RAM: compute the cached experts while the missing ones are copied
+    #[arg(long)]
+    overlap: bool,
+    /// Experts in RAM: the CPU computes the experts missing from VRAM
+    #[arg(long)]
+    cpu_misses: bool,
+    /// With --cpu-misses: the CPU's output joins one layer later (Expert Deferral)
+    #[arg(long)]
+    deferral: bool,
+    /// Experts in RAM: the prefill copies the next batch of experts while the current one runs
+    #[arg(long)]
+    prefill_overlap: bool,
 }
 
 impl Common {
     fn params(&self) -> SampleParams {
         SampleParams { temperature: self.temperature, top_k: self.top_k, top_p: self.top_p, pad: 0, seed: self.seed }
     }
+    fn offload(&self) -> drama::engine::Offload {
+        drama::engine::Offload {
+            max_ref: self.max_ref,
+            score_ref: self.score_ref,
+            prefetch: self.prefetch,
+            overlap: self.overlap,
+            cpu_misses: self.cpu_misses,
+            deferral: self.deferral,
+            prefill_overlap: self.prefill_overlap,
+        }
+    }
     fn vram_limit(&self) -> usize {
         (self.vram_gb * (1u64 << 30) as f64) as usize
     }
     fn engine(&self) -> Result<Engine> {
-        let tts = tts::Tts::load_with(&self.model, self.max_len, self.chunk, self.vram_limit())?;
+        let tts = tts::Tts::load_offload(&self.model, self.max_len, self.chunk, self.vram_limit(), self.offload())?;
         let engine = tts.engine;
         let (free, total) = gpu::mem_info()?;
         eprintln!("GPU memory: {:.2} GiB used of {:.2} GiB", (total - free) as f64 / (1u64 << 30) as f64, total as f64 / (1u64 << 30) as f64);
@@ -175,7 +207,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("give --text, or --interactive to read lines from stdin");
             }
             let t_load = Instant::now();
-            let mut tts = tts::Tts::load_with(&common.model, common.max_len, common.chunk, common.vram_limit())?;
+            let mut tts = tts::Tts::load_offload(&common.model, common.max_len, common.chunk, common.vram_limit(), common.offload())?;
             tts.engine.reuse_voice = !common.no_voice_reuse;
             let (free, total) = gpu::mem_info()?;
             eprintln!(

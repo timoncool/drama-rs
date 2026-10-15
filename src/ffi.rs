@@ -16,7 +16,19 @@ extern "C" {
     pub fn dr_free(p: *mut c_void) -> i32;
     pub fn dr_host_alloc(p: *mut *mut c_void, n: usize) -> i32;
     pub fn dr_host_free(p: *mut c_void) -> i32;
-    pub fn dr_host_alloc_mapped(p: *mut *mut c_void, dev: *mut *mut c_void, n: usize) -> i32;
+    pub fn dr_host_alloc_mapped(p: *mut *mut c_void, dev: *mut *mut c_void, n: usize, write_combined: i32) -> i32;
+    pub fn dr_event_create(e: *mut *mut c_void) -> i32;
+    pub fn dr_event_record(e: *mut c_void, s: Stream) -> i32;
+    pub fn dr_stream_wait(s: Stream, e: *mut c_void) -> i32;
+    pub fn dr_host_func(s: Stream, f: unsafe extern "C" fn(*mut c_void), user: *mut c_void) -> i32;
+    pub fn dr_expert_release(fill: *const i32, topk: i32, tag: *mut u32, state: *const u32, st: Stream) -> i32;
+    pub fn dr_moe_mask_misses(fill: *const i32, sidx: *const i32, wts: *const f32, zero_slot: i32, topk: i32, sidx2: *mut i32, wts2: *mut f32, st: Stream) -> i32;
+    pub fn dr_add_vec(x: *mut f32, y: *const f32, n: i32, st: Stream) -> i32;
+    pub fn dr_moe_decode_split(
+        gu_q: *const u8, gu_sm: *const Half, d_q: *const u8, d_sm: *const Half, sgu_q: *const i8, sgu_s: *const Half, sd_q: *const i8,
+        sd_s: *const Half, x: *const f32, idx: *const i32, wts: *const f32, sgate: *const f32, res: *const f32, act: *mut f32, y: *mut f32,
+        h: i32, i: i32, topk: i32, nw: *const f32, eps: f32, fill: *const i32, mode: i32, pf: *const c_char, pf_bytes: usize, st: Stream,
+    ) -> i32;
     pub fn dr_h2d(d: *mut c_void, h: *const c_void, n: usize, st: Stream) -> i32;
     pub fn dr_d2h(h: *mut c_void, d: *const c_void, n: usize, st: Stream) -> i32;
     pub fn dr_d2d(d: *mut c_void, s: *const c_void, n: usize, st: Stream) -> i32;
@@ -62,7 +74,7 @@ extern "C" {
     pub fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream) -> i32;
     pub fn dr_expert_slots(
         idx: *const i32, topk: i32, key0: i32, s: i32, map: *mut i32, owner: *mut i32, refb: *mut u32, tag: *mut u32, state: *mut u32, sidx: *mut i32,
-        fill: *mut i32, st: Stream,
+        fill: *mut i32, max_ref: u32, protect_prev: i32, pending: i32, count: i32, insert: i32, wts: *const f32, score_ref: f32, st: Stream,
     ) -> i32;
     pub fn dr_expert_fill(
         idx: *const i32, fill: *const i32, topk: i32, g_q: *const c_void, g_sm: *const c_void, d_q: *const c_void, d_sm: *const c_void, c_gq: *mut c_void,

@@ -112,7 +112,11 @@ pub enum Experts {
 pub enum Bank {
     Dev(DevBuf),
     Host(HostBuf),
+    /// Left in the memory-mapped weights file (pageable): past the page-locking cap. Only the CPU reads it.
+    Mapped(std::sync::Arc<Mmap>, *const u8),
 }
+
+unsafe impl Send for Bank {}
 
 impl Bank {
     /// The address kernels read.
@@ -120,6 +124,7 @@ impl Bank {
         match self {
             Bank::Dev(b) => b.ptr::<u8>(),
             Bank::Host(b) => b.dev::<u8>(),
+            Bank::Mapped(..) => std::ptr::null(),
         }
     }
 
@@ -128,7 +133,13 @@ impl Bank {
         match self {
             Bank::Dev(_) => None,
             Bank::Host(b) => Some(b.host::<u8>()),
+            Bank::Mapped(_, p) => Some(*p),
         }
+    }
+
+    /// The GPU cannot read it (pageable memory).
+    pub fn mapped(&self) -> bool {
+        matches!(self, Bank::Mapped(..))
     }
 }
 
@@ -232,7 +243,7 @@ pub struct Model {
 }
 
 pub struct HostTensor {
-    _map: Mmap,
+    _map: std::sync::Arc<Mmap>,
     ptr: *const u8,
     pub shape: Vec<usize>,
 }
@@ -249,13 +260,13 @@ impl HostTensor {
 }
 
 struct File {
-    map: Mmap,
+    map: std::sync::Arc<Mmap>,
 }
 
 impl File {
     fn open(path: &Path) -> Result<Self> {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let map = unsafe { Mmap::map(&f)? };
+        let map = std::sync::Arc::new(unsafe { Mmap::map(&f)? });
         Ok(Self { map })
     }
     fn st(&self) -> Result<SafeTensors<'_>> {
@@ -270,6 +281,11 @@ struct Loader<'a> {
     uploaded: &'a mut usize,
     experts: Experts,
     in_ram: &'a mut usize,
+    write_combined: bool,
+    map: Option<std::sync::Arc<Mmap>>,
+    /// Bytes of experts that may still be page-locked; past it they stay in the mapped file.
+    pin_left: &'a mut usize,
+    in_file: &'a mut usize,
 }
 
 impl Loader<'_> {
@@ -311,9 +327,19 @@ impl Loader<'_> {
         if t.dtype() != dtype {
             bail!("{}{name}: dtype {:?}, expected {dtype:?}", self.prefix, t.dtype());
         }
-        let buf = HostBuf::from_bytes(t.data()).with_context(|| format!("{}{name}: page-locked RAM for the experts", self.prefix))?;
-        *self.in_ram += t.data().len();
-        Ok((Bank::Host(buf), t.shape().to_vec()))
+        let len = t.data().len();
+        if len <= *self.pin_left {
+            // the driver may refuse before our cap (Windows limits page-locked memory per process): the rest stays mapped
+            if let Ok(buf) = HostBuf::from_bytes(t.data(), self.write_combined) {
+                *self.pin_left -= len;
+                *self.in_ram += len;
+                return Ok((Bank::Host(buf), t.shape().to_vec()));
+            }
+            *self.pin_left = 0;
+        }
+        let map = self.map.clone().ok_or_else(|| anyhow!("{}{name}: no file mapping for unpinned experts", self.prefix))?;
+        *self.in_file += len;
+        Ok((Bank::Mapped(map, t.data().as_ptr()), t.shape().to_vec()))
     }
 
     fn q4(&mut self, name: &str) -> Result<Q4> {
@@ -321,6 +347,48 @@ impl Loader<'_> {
         let (sm, _) = self.bank(&format!("{name}.sm"), Dtype::F16)?;
         Ok(Q4 { q, sm, n: shape[1], k: shape[2] * 2 })
     }
+}
+
+/// Page-locked memory the experts may take: `DRAMA_PIN_CAP_GB`, else 45% of physical RAM on Windows (WDDM refuses
+/// page-locking past about half of it per process) and 75% elsewhere.
+fn pin_cap() -> usize {
+    if let Some(gb) = std::env::var("DRAMA_PIN_CAP_GB").ok().and_then(|v| v.parse::<f64>().ok()) {
+        return (gb * (1u64 << 30) as f64) as usize;
+    }
+    let ram = physical_ram();
+    if cfg!(windows) { ram / 100 * 45 } else { ram / 4 * 3 }
+}
+
+#[cfg(windows)]
+fn physical_ram() -> usize {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page: u64,
+        avail_page: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_ext: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, load: 0, total_phys: 0, avail_phys: 0, total_page: 0, avail_page: 0, total_virtual: 0, avail_virtual: 0, avail_ext: 0 };
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return usize::MAX;
+    }
+    m.total_phys as usize
+}
+
+#[cfg(not(windows))]
+fn physical_ram() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok()))
+        .map_or(usize::MAX, |kb| kb * 1024)
 }
 
 fn inv_freq(theta: f64, rot: usize) -> Vec<f32> {
@@ -346,7 +414,9 @@ pub fn full_vram(dir: &Path) -> Result<u64> {
 }
 
 impl Model {
-    pub fn load(dir: &Path, stream: &Stream, experts: Experts) -> Result<Self> {
+    /// `cpu_reads`: with `Experts::Ram`, the CPU also reads the experts (computes some of them), so they are not
+    /// write-combined.
+    pub fn load(dir: &Path, stream: &Stream, experts: Experts, cpu_reads: bool) -> Result<Self> {
         let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
         let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("drama.json")).context("read drama.json")?)?;
         if meta.format != "drama-rs-v1" || meta.q4_group != 64 || meta.q8_group != 128 {
@@ -358,11 +428,24 @@ impl Model {
         let t0 = std::time::Instant::now();
         let mut uploaded = 0usize;
         let mut in_ram = 0usize;
+        let mut in_file = 0usize;
+        let mut pin_left = pin_cap();
 
         let mut layers = Vec::with_capacity(tc.num_hidden_layers);
         for i in 0..tc.num_hidden_layers {
             let file = File::open(&dir.join(format!("layer{i:02}.safetensors")))?;
-            let mut l = Loader { st: file.st()?, stream, prefix: format!("layer{i:02}."), uploaded: &mut uploaded, experts, in_ram: &mut in_ram };
+            let mut l = Loader {
+                st: file.st()?,
+                stream,
+                prefix: format!("layer{i:02}."),
+                uploaded: &mut uploaded,
+                experts,
+                in_ram: &mut in_ram,
+                write_combined: !cpu_reads,
+                map: Some(file.map.clone()),
+                pin_left: &mut pin_left,
+                in_file: &mut in_file,
+            };
             let mixer = if cfg.is_linear(i) {
                 Mixer::Linear(LinearAttn {
                     in_proj: l.q8("la.in_proj")?,
@@ -400,7 +483,7 @@ impl Model {
         }
 
         let file = File::open(&dir.join("tower.safetensors"))?;
-        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram };
+        let mut l = Loader { st: file.st()?, stream, prefix: "tower.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, write_combined: true, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let mut tower = Vec::new();
         for t in 0..cfg.tower_layers() {
             let p = format!("t{t}.");
@@ -427,7 +510,7 @@ impl Model {
 
         let gfile = File::open(&dir.join("globals.safetensors"))?;
         let gst = gfile.st()?;
-        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram };
+        let mut l = Loader { st: gfile.st()?, stream, prefix: "globals.".into(), uploaded: &mut uploaded, experts: Experts::Vram, in_ram: &mut in_ram, write_combined: true, map: None, pin_left: &mut pin_left, in_file: &mut in_file };
         let lm_head_cand = l.bf16("lm_head_cand")?;
         let final_norm = l.f32("final_norm")?;
         stream.sync()?;
@@ -458,13 +541,16 @@ impl Model {
         let tower_inv_freq = Dense { buf: DevBuf::from_slice(&inv_freq(dc.rope_base, trot), stream)?, shape: vec![trot / 2] };
         stream.sync()?;
 
-        if in_ram > 0 {
+        if in_ram + in_file > 0 {
             eprintln!(
-                "loaded {:.2} GB of weights to the GPU and {:.2} GB of experts to RAM in {:.1}s",
+                "loaded {:.2} GB of weights to the GPU and {:.2} GB of experts to page-locked RAM in {:.1}s",
                 (uploaded + cand.len()) as f64 / 1e9,
                 in_ram as f64 / 1e9,
                 t0.elapsed().as_secs_f64()
             );
+            if in_file > 0 {
+                eprintln!("{:.2} GB of experts past the page-locking cap stay in the mapped files; the CPU computes them", in_file as f64 / 1e9);
+            }
         } else {
             eprintln!("loaded {:.2} GB of weights in {:.1}s", (uploaded + cand.len()) as f64 / 1e9, t0.elapsed().as_secs_f64());
         }

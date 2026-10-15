@@ -475,11 +475,17 @@ template <int K>
 __global__ void __launch_bounds__(MOE_WARPS * 32)
     k_moe_gate_up_q4(const uint8_t* __restrict__ Q, const __half2* __restrict__ SM, const int8_t* __restrict__ shq,
                      const __half* __restrict__ shs, const float* __restrict__ x, const int* __restrict__ idx,
-                     float* __restrict__ act, int I, int topk, const float* __restrict__ nw, float eps) {
+                     float* __restrict__ act, int I, int topk, const float* __restrict__ nw, float eps,
+                     const int* __restrict__ fill, int mode) {
   __shared__ float4 xs4[K / 4];
   __shared__ float xcs[K / 32];
-  stage_x_norm<K>(x, nw, eps, xs4);
   const int k = blockIdx.y;
+  // mode 1: the shared expert and the experts already in their slots; mode 2: the experts being filled
+  if (mode != 0) {
+    const bool filled = k < topk && fill[k] >= 0;
+    if ((mode == 1 && filled) || (mode == 2 && !filled)) return;
+  }
+  stage_x_norm<K>(x, nw, eps, xs4);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int j0 = (blockIdx.x * MOE_WARPS + warp) * MOE_RPW;
   if (k == topk) {
@@ -591,9 +597,25 @@ API int dr_moe_decode(const uint8_t* gu_q, const __half2* gu_sm, const uint8_t* 
                       size_t pf_bytes, cudaStream_t st) {
   if (H != 2048 || I != 512 || topk != 8) return -1;
   k_moe_gate_up_q4<2048><<<dim3((I + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), topk + 1),
-                           MOE_WARPS * 32, 0, st>>>(gu_q, gu_sm, sgu_q, sgu_s, x, idx, act, I, topk, nw, eps);
+                           MOE_WARPS * 32, 0, st>>>(gu_q, gu_sm, sgu_q, sgu_s, x, idx, act, I, topk, nw, eps, nullptr, 0);
   k_moe_down_q4<512, 8><<<(H + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), MOE_WARPS * 32, 0, st>>>(
       d_q, d_sm, sd_q, sd_s, act, idx, wts, sgate, res, y, H, pf, pf_bytes);
+  return 0;
+}
+
+// dr_moe_decode in two passes around a fill: `mode` 1 runs the shared expert and the routed experts with fill[k] < 0
+// (gate/up only), `mode` 2 the others and then the down projection of all.
+API int dr_moe_decode_split(const uint8_t* gu_q, const __half2* gu_sm, const uint8_t* d_q, const __half2* d_sm,
+                            const int8_t* sgu_q, const __half* sgu_s, const int8_t* sd_q, const __half* sd_s,
+                            const float* x, const int* idx, const float* wts, const float* sgate, const float* res,
+                            float* act, float* y, int H, int I, int topk, const float* nw, float eps, const int* fill,
+                            int mode, const char* pf, size_t pf_bytes, cudaStream_t st) {
+  if (H != 2048 || I != 512 || topk != 8 || (mode != 1 && mode != 2)) return -1;
+  k_moe_gate_up_q4<2048><<<dim3((I + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), topk + 1),
+                           MOE_WARPS * 32, 0, st>>>(gu_q, gu_sm, sgu_q, sgu_s, x, idx, act, I, topk, nw, eps, fill, mode);
+  if (mode == 2)
+    k_moe_down_q4<512, 8><<<(H + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), MOE_WARPS * 32, 0, st>>>(
+        d_q, d_sm, sd_q, sd_s, act, idx, wts, sgate, res, y, H, pf, pf_bytes);
   return 0;
 }
 
@@ -869,10 +891,17 @@ API int dr_moe_prefill_where(const uint8_t* c_gq, const __half2* c_gsm, const ui
 //   ref[s]              CLOCK reference bit;  tag[s] the call that last used slot s (never evicted by that call)
 //   state               [0] clock hand, [1] call counter, [2..3] hits (u64), [4..5] misses (u64)
 
+// max_ref: the reference count a hit raises a slot to (1 = CLOCK, more = GCLOCK, frequency-aware). protect_prev: the
+// previous call's slots are not evicted either (a prefetch runs while that call's experts are being read). pending: a
+// filled slot stays unevictable (tag ~0u) until `dr_expert_release` marks it after its copy.
+constexpr unsigned SLOT_PENDING = 0xffffffffu;
+
 __global__ void __launch_bounds__(32)
     k_expert_slots(const int* __restrict__ idx, int topk, int key0, int S, int* __restrict__ map,
                    int* __restrict__ owner, unsigned* __restrict__ ref, unsigned* __restrict__ tag,
-                   unsigned* __restrict__ state, int* __restrict__ sidx, int* __restrict__ fill) {
+                   unsigned* __restrict__ state, int* __restrict__ sidx, int* __restrict__ fill, unsigned max_ref,
+                   int protect_prev, int pending, int count, int insert, const float* __restrict__ wts,
+                   float score_ref) {
   const int lane = threadIdx.x;
   __shared__ unsigned tick;
   if (lane == 0) tick = ++state[1];
@@ -880,9 +909,11 @@ __global__ void __launch_bounds__(32)
   bool miss = false;
   if (lane < topk) {
     const int s = map[key0 + idx[lane]];
+    // with score_ref, an expert the router weighs more stays longer (HybriMoE's MRS, in GCLOCK form)
+    const unsigned inc = 1u + (score_ref > 0.f ? (unsigned)(wts[lane] * score_ref) : 0u);
     if (s >= 0) {
-      ref[s] = 1u;
-      tag[s] = tick;
+      ref[s] = min(ref[s] + inc, max_ref);
+      if (tag[s] != SLOT_PENDING) tag[s] = tick;
       sidx[lane] = s;
       fill[lane] = -1;
     } else {
@@ -890,11 +921,19 @@ __global__ void __launch_bounds__(32)
     }
   }
   unsigned need = __ballot_sync(0xffffffffu, miss);
-  if (lane == 0) {
+  if (lane == 0 && count) {
     atomicAdd(reinterpret_cast<unsigned long long*>(state + 2), (unsigned long long)(topk - __popc(need)));
     atomicAdd(reinterpret_cast<unsigned long long*>(state + 4), (unsigned long long)__popc(need));
   }
   __syncwarp();
+  if (!insert) {
+    // a layer the GPU cannot fill (its experts are not page-locked): the misses get no slot, the CPU computes them
+    if (miss) {
+      fill[lane] = -2;
+      sidx[lane] = 0;
+    }
+    return;
+  }
   unsigned hand = state[0];
   while (need) {
     const int k = __ffs(need) - 1;
@@ -902,10 +941,11 @@ __global__ void __launch_bounds__(32)
     int victim = -1;
     while (victim < 0) {
       const int s = (int)((hand + lane) % S);
-      const bool used = tag[s] == tick;
+      const unsigned t = tag[s];
+      const bool used = t == tick || t == SLOT_PENDING || (protect_prev && t + 1u == tick);
       const unsigned m = __ballot_sync(0xffffffffu, !used && ref[s] == 0u);
       const int first = m ? __ffs(m) - 1 : 32;
-      if (lane < first && !used) ref[s] = 0u;
+      if (lane < first && !used && ref[s] > 0u) ref[s] -= 1u;
       __syncwarp();
       if (m) {
         victim = (int)((hand + first) % S);
@@ -920,8 +960,8 @@ __global__ void __launch_bounds__(32)
       if (old >= 0) map[old] = -1;
       owner[victim] = key;
       map[key] = victim;
-      ref[victim] = 1u;
-      tag[victim] = tick;
+      ref[victim] = min(1u + (score_ref > 0.f ? (unsigned)(wts[k] * score_ref) : 0u), max_ref);
+      tag[victim] = pending ? SLOT_PENDING : tick;
       sidx[k] = victim;
       fill[k] = victim;
     }
@@ -931,9 +971,50 @@ __global__ void __launch_bounds__(32)
 }
 
 API int dr_expert_slots(const int* idx, int topk, int key0, int S, int* map, int* owner, unsigned* ref, unsigned* tag,
-                        unsigned* state, int* sidx, int* fill, cudaStream_t st) {
-  if (topk > 32 || S < topk) return -1;
-  k_expert_slots<<<1, 32, 0, st>>>(idx, topk, key0, S, map, owner, ref, tag, state, sidx, fill);
+                        unsigned* state, int* sidx, int* fill, unsigned max_ref, int protect_prev, int pending,
+                        int count, int insert, const float* wts, float score_ref, cudaStream_t st) {
+  if (topk > 32 || S < 2 * topk || max_ref < 1) return -1;
+  k_expert_slots<<<1, 32, 0, st>>>(idx, topk, key0, S, map, owner, ref, tag, state, sidx, fill, max_ref, protect_prev,
+                                   pending, count, insert, wts, score_ref);
+  return 0;
+}
+
+// After a pending fill: its slots become ordinary (evictable) slots of the current call.
+__global__ void k_expert_release(const int* __restrict__ fill, int topk, unsigned* __restrict__ tag,
+                                 const unsigned* __restrict__ state) {
+  const int k = threadIdx.x;
+  if (k < topk && fill[k] >= 0) tag[fill[k]] = state[1];
+}
+
+API int dr_expert_release(const int* fill, int topk, unsigned* tag, const unsigned* state, cudaStream_t st) {
+  k_expert_release<<<1, 32, 0, st>>>(fill, topk, tag, state);
+  return 0;
+}
+
+// The experts the CPU computes (fill[k] >= 0) leave the GPU pass: weight 0 on a zeroed slot.
+__global__ void k_moe_mask_misses(const int* __restrict__ fill, const int* __restrict__ sidx,
+                                  const float* __restrict__ wts, int zero_slot, int topk, int* __restrict__ sidx2,
+                                  float* __restrict__ wts2) {
+  const int k = threadIdx.x;
+  if (k >= topk) return;
+  const bool miss = fill[k] != -1;
+  sidx2[k] = miss ? zero_slot : sidx[k];
+  wts2[k] = miss ? 0.f : wts[k];
+}
+
+API int dr_moe_mask_misses(const int* fill, const int* sidx, const float* wts, int zero_slot, int topk, int* sidx2,
+                           float* wts2, cudaStream_t st) {
+  k_moe_mask_misses<<<1, 32, 0, st>>>(fill, sidx, wts, zero_slot, topk, sidx2, wts2);
+  return 0;
+}
+
+__global__ void k_add_vec(float* __restrict__ x, const float* __restrict__ y, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] += y[i];
+}
+
+API int dr_add_vec(float* x, const float* y, int n, cudaStream_t st) {
+  k_add_vec<<<(n + 255) / 256, 256, 0, st>>>(x, y, n);
   return 0;
 }
 
@@ -1871,9 +1952,9 @@ API int dr_malloc(void** p, size_t n) { return (int)cudaMalloc(p, n); }
 API int dr_free(void* p) { return (int)cudaFree(p); }
 API int dr_host_alloc(void** p, size_t n) { return (int)cudaMallocHost(p, n); }
 API int dr_host_free(void* p) { return (int)cudaFreeHost(p); }
-// Written once by the CPU and read by the GPU only: write-combined, mapped so kernels read it over PCIe.
-API int dr_host_alloc_mapped(void** p, void** dev, size_t n) {
-  cudaError_t e = cudaHostAlloc(p, n, cudaHostAllocMapped | cudaHostAllocPortable | cudaHostAllocWriteCombined);
+// Mapped so kernels read it over PCIe. Write-combined when only the GPU reads it (CPU reads of it are uncached).
+API int dr_host_alloc_mapped(void** p, void** dev, size_t n, int write_combined) {
+  cudaError_t e = cudaHostAlloc(p, n, cudaHostAllocMapped | cudaHostAllocPortable | (write_combined ? cudaHostAllocWriteCombined : 0));
   if (e != cudaSuccess) return (int)e;
   return (int)cudaHostGetDevicePointer(dev, *p, 0);
 }
@@ -1889,6 +1970,10 @@ API int dr_d2d(void* d, const void* s, size_t n, cudaStream_t st) {
 API int dr_memset(void* d, int v, size_t n, cudaStream_t st) { return (int)cudaMemsetAsync(d, v, n, st); }
 API int dr_stream_create(cudaStream_t* s) { return (int)cudaStreamCreateWithFlags(s, cudaStreamNonBlocking); }
 API int dr_stream_sync(cudaStream_t s) { return (int)cudaStreamSynchronize(s); }
+API int dr_event_create(cudaEvent_t* e) { return (int)cudaEventCreateWithFlags(e, cudaEventDisableTiming); }
+API int dr_event_record(cudaEvent_t e, cudaStream_t s) { return (int)cudaEventRecord(e, s); }
+API int dr_stream_wait(cudaStream_t s, cudaEvent_t e) { return (int)cudaStreamWaitEvent(s, e, 0); }
+API int dr_host_func(cudaStream_t s, cudaHostFn_t f, void* user) { return (int)cudaLaunchHostFunc(s, f, user); }
 API int dr_device_sync(void) { return (int)cudaDeviceSynchronize(); }
 API int dr_mem_info(size_t* free_b, size_t* total_b) { return (int)cudaMemGetInfo(free_b, total_b); }
 
