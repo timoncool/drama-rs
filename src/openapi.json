@@ -1,0 +1,127 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "drama serve",
+    "version": "VERSION",
+    "description": "Fish Audio Drama 3 text-to-speech over HTTP. The GPU engine is single-tenant: requests queue and run one at a time.\n\nAudio is `audio/wav`, 44.1 kHz mono 16-bit PCM.",
+    "license": { "name": "Apache-2.0" }
+  },
+  "paths": {
+    "/v1/speak": {
+      "post": {
+        "summary": "Render text to speech",
+        "description": "Send JSON, or the text itself as a plain body. Speaker tags (`<|speaker:0|>`) and inline tags such as `[laughs]` work as on the command line. With `stream` the WAV is sent while it is generated, with an open-ended header that `pw-play`, `ffplay` and `mpv` accept.",
+        "operationId": "speak",
+        "parameters": [
+          { "name": "stream", "in": "query", "description": "Stream the WAV as it is generated (`1`/`true`; `0`/`false`/`no` turn it off). Overrides the body.", "schema": { "type": "string" } },
+          { "name": "voice", "in": "query", "description": "Registered voice to clone. Overrides the body.", "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SpeakRequest" },
+              "examples": {
+                "plain": { "summary": "Default voice", "value": { "text": "Hello from drama. [laughs]" } },
+                "clone": { "summary": "Cloned voice, streamed", "value": { "text": "Hello again.", "voice": "alice", "stream": true } },
+                "dialogue": { "summary": "Two speakers", "value": { "text": "<|speaker:0|> Did you hear that? <|speaker:1|> Hear what?", "voices": ["alice", "bob"] } }
+              }
+            },
+            "text/plain": { "schema": { "type": "string" }, "example": "Hello from drama." }
+          }
+        },
+        "responses": {
+          "200": { "description": "The speech.", "content": { "audio/wav": { "schema": { "type": "string", "format": "binary" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/voices": {
+      "get": {
+        "summary": "List registered voices",
+        "operationId": "listVoices",
+        "responses": {
+          "200": { "description": "Voice names, sorted.", "content": { "application/json": { "schema": { "type": "array", "items": { "type": "string" } }, "example": ["alice", "bob"] } } }
+        }
+      },
+      "post": {
+        "summary": "Register a voice to clone",
+        "description": "The body is a WAV clip of the voice (a few seconds to half a minute works well); `text` is what it says. Leave `text` out to have the clip transcribed with `fluid-speech` (400 if it is not installed). A voice with the same name is replaced. Voices last until the server restarts; `drama serve --voice NAME=WAV=TRANSCRIPT` preloads them.",
+        "operationId": "addVoice",
+        "parameters": [
+          { "name": "name", "in": "query", "required": true, "schema": { "type": "string" }, "example": "alice" },
+          { "name": "text", "in": "query", "description": "Transcript of the clip. Optional when `fluid-speech` is installed.", "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "audio/wav": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": {
+          "200": { "description": "Registered.", "content": { "text/plain": { "schema": { "type": "string" }, "example": "ok\n" } } },
+          "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/transcribe": {
+      "post": {
+        "summary": "Transcribe an audio clip",
+        "description": "The body is an audio clip (wav, flac, mp3, ogg, m4a). Needs the `fluid-speech` binary on `PATH` (or named by `$FLUID_SPEECH`); get it at https://fluid-speech-rs.apiplant.com. It runs on the CPU unless `$DRAMA_TRANSCRIBE_DEVICE` says otherwise, since the GPU holds the TTS model.",
+        "operationId": "transcribe",
+        "requestBody": { "required": true, "content": { "audio/*": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": {
+          "200": { "description": "The transcript.", "content": { "application/json": { "schema": { "type": "object", "required": ["text"], "properties": { "text": { "type": "string" } } }, "example": { "text": "Hello there." } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "500": { "$ref": "#/components/responses/Error" },
+          "501": { "description": "`fluid-speech` is not installed: transcription is disabled.", "content": { "text/plain": { "schema": { "type": "string" } } } }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "summary": "Server version and capabilities",
+        "operationId": "info",
+        "responses": {
+          "200": {
+            "description": "Version, sample rate, and whether transcription is available.",
+            "content": { "application/json": { "schema": { "type": "object" }, "example": { "version": "0.1.1", "sample_rate": 44100, "transcription": { "enabled": true, "binary": "/usr/bin/fluid-speech", "install_url": "https://fluid-speech-rs.apiplant.com" } } } }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Liveness check",
+        "operationId": "health",
+        "responses": { "200": { "description": "The server is up.", "content": { "text/plain": { "schema": { "type": "string" }, "example": "ok\n" } } } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "SpeakRequest": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "text": { "type": "string", "description": "What to say." },
+          "voice": { "type": "string", "description": "Registered voice to clone." },
+          "voices": {
+            "description": "Voices for multi-speaker text: a list makes the first speaker 0, the next speaker 1 and so on; a map picks the speaker numbers (0–15).",
+            "oneOf": [
+              { "type": "array", "items": { "type": "string" }, "example": ["alice", "bob"] },
+              { "type": "object", "additionalProperties": { "type": "string" }, "example": { "0": "alice", "3": "bob" } }
+            ]
+          },
+          "stream": { "type": "boolean", "default": false, "description": "Send the WAV while it is generated." },
+          "temperature": { "type": "number", "description": "Sampling temperature (server default from `--temperature`)." },
+          "top_k": { "type": "integer" },
+          "top_p": { "type": "number" },
+          "seed": { "type": "integer", "minimum": 0 },
+          "split": { "type": "boolean", "description": "Generate sentence by sentence (default on unless the server runs with `--no-split`)." },
+          "max_new": { "type": "integer", "description": "Most frames to generate per segment (default 2048)." }
+        }
+      }
+    },
+    "responses": {
+      "Error": { "description": "What went wrong, as one line of text.", "content": { "text/plain": { "schema": { "type": "string" } } } }
+    }
+  }
+}

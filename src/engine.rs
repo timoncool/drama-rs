@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use crate::ffi;
 use crate::cpu_moe::{CpuMoe, Io, LayerExperts};
 use crate::gpu::{check, launched, mem_info, Cublas, DevBuf, Graph, Pinned, Stream};
-use crate::model::{Dense, Experts, Layer, Mixer, Model, Q8};
+use crate::model::{Dense, Experts, Layer, Mixer, Model, Placement, Q8};
 
 pub const RAS_WINDOW: usize = 16;
 const ROUTER_PREFETCH: bool = false;
@@ -252,9 +252,9 @@ impl ExpertCache {
     /// Takes the VRAM free now less `keep_free`.
     fn new(model: &Model, keep_free: usize, st: &Stream) -> Result<Self> {
         let tc = &model.cfg.text_config;
-        let l0 = &model.layers[0];
-        let (gq, gs) = l0.gate_up.expert_bytes();
-        let (dq, ds) = l0.down.expert_bytes();
+        let (gu0, dn0) = model.layers[0].q4_in_ram();
+        let (gq, gs) = gu0.expert_bytes();
+        let (dq, ds) = dn0.expert_bytes();
         let bytes = [gq, gs, dq, ds];
         let per: usize = bytes.iter().sum();
         let stage = [
@@ -314,23 +314,28 @@ impl ExpertCache {
 
 /// Some of the layer's experts stay in the mapped file: the GPU cannot read them, the CPU computes their misses.
 fn layer_mapped(layer: &Layer) -> bool {
-    [&layer.gate_up.q, &layer.gate_up.sm, &layer.down.q, &layer.down.sm].iter().any(|b| b.mapped())
+    layer.q4().is_some_and(|(gu, dn)| [&gu.q, &gu.sm, &dn.q, &dn.sm].iter().any(|b| b.mapped()))
 }
 
 /// Bank part `p` of an expert bank as (device address for kernels, host address for copies).
 fn part(layer: &Layer, p: usize) -> (*const u8, Option<*const u8>) {
+    let (gu, dn) = layer.q4_in_ram();
     let bank = match p {
-        0 => &layer.gate_up.q,
-        1 => &layer.gate_up.sm,
-        2 => &layer.down.q,
-        _ => &layer.down.sm,
+        0 => &gu.q,
+        1 => &gu.sm,
+        2 => &dn.q,
+        _ => &dn.sm,
     };
     (bank.dev(), bank.host())
 }
 
 impl Engine {
+    pub fn new(model: Model, max_len: usize, chunk: usize) -> Result<Self> {
+        Self::with_cache(model, max_len, chunk, 0)
+    }
+
     /// `keep_free`: with the experts in RAM, the expert cache takes the VRAM free after the engine's buffers less this.
-    pub fn new(model: Model, max_len: usize, chunk: usize, keep_free: usize) -> Result<Self> {
+    pub fn with_cache(model: Model, max_len: usize, chunk: usize, keep_free: usize) -> Result<Self> {
         let st = Stream::new()?;
         let blas = Cublas::new(&st)?;
         launched(unsafe { ffi::dr_sample_init() }, "sample init")?;
@@ -477,7 +482,7 @@ impl Engine {
             rec: rec_state.iter().map(|c| c.as_ref().map(|c| DevBuf::alloc(c.bytes())).transpose()).collect::<Result<_>>()?,
             tkv: tkv.iter().map(|(a, b)| Ok((DevBuf::alloc(a.bytes())?, DevBuf::alloc(b.bytes())?))).collect::<Result<_>>()?,
         };
-        let cache = if model.experts == Experts::Ram { Some(ExpertCache::new(&model, keep_free, &st)?) } else { None };
+        let cache = if model.placement == Placement::Ram { Some(ExpertCache::new(&model, keep_free, &st)?) } else { None };
         let any_mapped = model.layers.iter().any(layer_mapped);
         let cpu_on = cache.is_some() && any_mapped;
         let mut norms = Vec::new();
@@ -489,11 +494,12 @@ impl Engine {
             for l in &model.layers {
                 norms.push(l.post_norm.buf.download::<f32>(d, &st)?);
                 let host = |b: &crate::model::Bank| b.host().expect("experts in RAM");
+                let (gu, dn) = l.q4_in_ram();
                 layers.push(LayerExperts {
-                    gu_q: host(&l.gate_up.q),
-                    gu_sm: host(&l.gate_up.sm) as *const u16,
-                    d_q: host(&l.down.q),
-                    d_sm: host(&l.down.sm) as *const u16,
+                    gu_q: host(&gu.q),
+                    gu_sm: host(&gu.sm) as *const u16,
+                    d_q: host(&dn.q),
+                    d_sm: host(&dn.sm) as *const u16,
                     norm: norms.last().unwrap().as_ptr(),
                 });
             }
@@ -846,11 +852,19 @@ impl Engine {
         if let Some(c) = &self.cache {
             self.moe_prefill_ram(c, li, layer, &counts, first_chunk && !c.seeded)?;
         } else {
-            let (gq, gs) = layer.gate_up.expert(0);
-            let (dq, ds) = layer.down.expert(0);
             launched(
                 unsafe {
-                    ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                    match &layer.experts {
+                        Experts::Q4 { gate_up, down } => {
+                            let (gq, gs) = gate_up.expert(0);
+                            let (dq, ds) = down.expert(0);
+                            ffi::dr_moe_prefill(gq, gs, dq, ds, h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32, mi as i32, s)
+                        }
+                        Experts::Fp8(x) => ffi::dr_moe_prefill_fp8(
+                            x.gu_w.ptr(), x.gu_s.ptr(), x.d_w.ptr(), x.d_s.ptr(), h(&p.xp), i(&p.offsets), i(&p.counts), h(&p.ap), f(&p.yp), e as i32, d as i32,
+                            mi as i32, s,
+                        ),
+                    }
                 },
                 "moe_prefill",
             )?;
@@ -1311,16 +1325,25 @@ impl Engine {
             let e = tc.num_experts;
             let topk = tc.num_experts_per_tok;
             let cache = self.cache.as_ref();
-            // with the experts in RAM the kernels read the cache slots, addressed by slot ids
-            let ((gq, gs), (dq, ds), moe_idx) = match cache {
-                Some(c) => (
-                    (c.banks[0].ptr::<u8>() as *const u8, c.banks[1].ptr::<u16>() as *const u16),
-                    (c.banks[2].ptr::<u8>() as *const u8, c.banks[3].ptr::<u16>() as *const u16),
-                    i(&c.sidx),
+            // Expert weights as raw (q, scale) pointers; the router warms L2 only for the int4 layout on the GPU. With the
+            // int4 experts in RAM the kernels read the cache slots, addressed by slot ids.
+            let (gq, gs, dq, ds, pf_sizes, fp8) = match (&layer.experts, cache) {
+                (Experts::Q4 { gate_up: gu, down: dn }, Some(c)) => (
+                    c.banks[0].ptr::<u8>() as *const u8,
+                    c.banks[1].ptr::<u8>() as *const u8,
+                    c.banks[2].ptr::<u8>() as *const u8,
+                    c.banks[3].ptr::<u8>() as *const u8,
+                    [gu.n * gu.k / 2, gu.n * (gu.k / 64) * 4, dn.n * dn.k / 2, dn.n * (dn.k / 64) * 4],
+                    false,
                 ),
-                None => (layer.gate_up.expert(0), layer.down.expert(0), i(&b.idx)),
+                (Experts::Q4 { gate_up: gu, down: dn }, None) => {
+                    let (gq, gs) = gu.expert(0);
+                    let (dq, ds) = dn.expert(0);
+                    (gq, gs as *const u8, dq, ds as *const u8, [gu.n * gu.k / 2, gu.n * (gu.k / 64) * 4, dn.n * dn.k / 2, dn.n * (dn.k / 64) * 4], false)
+                }
+                (Experts::Fp8(x), _) => (x.gu_w.ptr() as *const u8, x.gu_s.ptr() as *const u8, x.d_w.ptr() as *const u8, x.d_s.ptr() as *const u8, [0; 4], true),
             };
-            let (gu, dn) = (&layer.gate_up, &layer.down);
+            let moe_idx = cache.map_or(i(&b.idx), |c| i(&c.sidx));
             let router = &layer.router;
             let post = &layer.post_norm;
             ops.push(Op::weights(router.bf16() as *const u8, (e + 1) * d * 2, move |_, _| {
@@ -1340,14 +1363,14 @@ impl Engine {
                             f(&b.wts),
                             f(&b.sgate),
                             b.counter.ptr::<u32>(),
-                            if ROUTER_PREFETCH && cache.is_none() { gq as *const std::ffi::c_char } else { std::ptr::null() },
+                            if ROUTER_PREFETCH && !fp8 && cache.is_none() { gq as *const std::ffi::c_char } else { std::ptr::null() },
                             gs as *const std::ffi::c_char,
                             dq as *const std::ffi::c_char,
                             ds as *const std::ffi::c_char,
-                            gu.n * gu.k / 2,
-                            gu.n * (gu.k / 64) * 4,
-                            dn.n * dn.k / 2,
-                            dn.n * (dn.k / 64) * 4,
+                            pf_sizes[0],
+                            pf_sizes[1],
+                            pf_sizes[2],
+                            pf_sizes[3],
                             s,
                         )
                     },
@@ -1357,19 +1380,26 @@ impl Engine {
             let (sgq, sgs) = layer.shared_gate_up.rows(0);
             let (sdq, sds) = layer.shared_down.rows(0);
             let mi = tc.moe_intermediate_size;
-            let moe = move |gq: *const u8, gs: *const u16, dq: *const u8, ds: *const u16, idx: *const i32, wts: *const f32, pf: *const std::ffi::c_char, pfb: usize| {
+            let moe = move |idx: *const i32, wts: *const f32, pf: *const std::ffi::c_char, pfb: usize| {
                 launched(
                     unsafe {
-                        ffi::dr_moe_decode(
-                            gq, gs, dq, ds, sgq, sgs, sdq, sds, f(&b.x), idx, wts, f(&b.sgate), f(&b.x), f(&b.act), f(&b.x), d as i32, mi as i32,
-                            topk as i32, post.f32(), eps, pf, pfb, s,
-                        )
+                        if fp8 {
+                            ffi::dr_moe_decode_fp8(
+                                gq, gs as *const f32, dq, ds as *const f32, sgq, sgs, sdq, sds, f(&b.x), idx, wts, f(&b.sgate), f(&b.x), f(&b.act), f(&b.x),
+                                d as i32, mi as i32, topk as i32, post.f32(), eps, pf, pfb, s,
+                            )
+                        } else {
+                            ffi::dr_moe_decode(
+                                gq, gs as *const u16, dq, ds as *const u16, sgq, sgs, sdq, sds, f(&b.x), idx, wts, f(&b.sgate), f(&b.x), f(&b.act), f(&b.x),
+                                d as i32, mi as i32, topk as i32, post.f32(), eps, pf, pfb, s,
+                            )
+                        }
                     },
                     "moe_decode",
                 )
             };
             let Some(c) = cache else {
-                ops.push(Op::plain(move |pf, pfb| moe(gq, gs, dq, ds, moe_idx, f(&b.wts), pf, pfb)));
+                ops.push(Op::plain(move |pf, pfb| moe(moe_idx, f(&b.wts), pf, pfb)));
                 continue;
             };
             let mapped = layer_mapped(layer);
@@ -1399,7 +1429,7 @@ impl Engine {
                         },
                         "expert_fill",
                     )?;
-                    return moe(gq, gs, dq, ds, moe_idx, f(&b.wts), pf, pfb);
+                    return moe(moe_idx, f(&b.wts), pf, pfb);
                 }
                 // the GPU cannot read this layer's experts: it computes the cached ones, the CPU the rest
                 let io = io.expect("cpu io");
@@ -1415,7 +1445,7 @@ impl Engine {
                     check(ffi::dr_d2h(std::ptr::addr_of_mut!((*io).fill) as *mut c_void, c.fill.ptr::<c_void>(), topk * I32, s), "d2h")?;
                     check(ffi::dr_host_func(s, cpu_submit, cpu.expect("cpu call")), "host func")?;
                 }
-                moe(gq, gs, dq, ds, i(&c.sidx2), f(&c.wts2), pf, pfb)?;
+                moe(i(&c.sidx2), f(&c.wts2), pf, pfb)?;
                 check(unsafe { ffi::dr_host_func(s, cpu_wait, cpu.expect("cpu call")) }, "host func")?;
                 check(unsafe { ffi::dr_h2d(out.ptr(), std::ptr::addr_of!((*io).out) as *const c_void, d * F32, s) }, "h2d")?;
                 check(unsafe { ffi::dr_add_vec(f(&b.x), f(out), d as i32, s) }, "add")

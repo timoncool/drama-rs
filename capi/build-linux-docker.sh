@@ -19,7 +19,7 @@ if [ "${1:-}" = "--inside" ]; then
   rm -rf /cache/src && mkdir -p /cache/src
   git -c safe.directory=/src -C /src archive HEAD | tar -x -C /cache/src
   cd /cache/src/capi
-  export CUDA_PATH=/usr/local/cuda DRAMA_CUDA_ARCH="$ARCHS" CARGO_TARGET_DIR=/cache/target
+  export CUDA_PATH=/usr/local/cuda DRAMA_CUDA_ARCH="$ARCHS" DRAMA_CUDA_NO_PTX=1 CARGO_TARGET_DIR=/cache/target
   export RUSTFLAGS='-C link-arg=-Wl,-rpath,$ORIGIN:$ORIGIN/../higgs-engine'
   echo "[..] build ($ARCHS)"
   cargo build --release 2>&1 | tail -5

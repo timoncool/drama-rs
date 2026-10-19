@@ -14,7 +14,7 @@ export function DocsLibrary() {
       <Section>
         <H2>Add the dependency</H2>
         <P>
-          The command-line binary (clap) is behind the default <IC>cli</IC> feature. Without it the crate depends on
+          The command-line binary (clap) is behind the default <IC>cli</IC> feature, which also enables <IC>download</IC> (ureq; find or fetch the model) and <IC>serve</IC> (the ntex HTTP server, <IC>drama::serve</IC>). Without them the crate depends on
           anyhow, half, hound, memmap2, safetensors, serde and tokenizers. The build script compiles the CUDA kernels
           with <IC>nvcc</IC> (<IC>CUDA_PATH</IC>, default <IC>/opt/cuda</IC>) for <IC>DRAMA_CUDA_ARCH</IC> (default{" "}
           <IC>sm_89</IC>; a comma-separated list builds several).

@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use drama::codec;
 use drama::engine::{Cancelled, SampleParams};
-use drama::model::Experts;
+use drama::model::Placement;
 use drama::prompt::Reference;
 use drama::tts::{SpeakOpts, Tts};
 
@@ -94,8 +94,9 @@ pub const DRAMA_EXPERTS_RAM: u32 = 2;
 pub unsafe extern "C" fn drama_load_ex(model_dir: *const c_char, max_len: u32, prefill_chunk: u32, vram_limit_mb: u32) -> *mut DramaEngine {
     let loaded = catch_unwind(AssertUnwindSafe(|| -> Result<DramaEngine, String> {
         let dir = text_arg(model_dir, "model_dir")?;
-        let tts = Tts::load_with(Path::new(&dir), max_len.max(256) as usize, prefill_chunk.max(16) as usize, vram_limit_mb as usize * (1 << 20))
-            .map_err(|e| format!("{e:#}"))?;
+        let dir = Path::new(&dir);
+        let experts = Tts::fitting(dir, vram_limit_mb as usize * (1 << 20)).map_err(|e| format!("{e:#}"))?;
+        let tts = Tts::load_with(dir, max_len.max(256) as usize, prefill_chunk.max(16) as usize, &experts).map_err(|e| format!("{e:#}"))?;
         let stop = tts.engine.stop.clone();
         Ok(DramaEngine { tts: Mutex::new(tts), stop, refs: Mutex::new(HashMap::new()) })
     }));
@@ -128,7 +129,7 @@ pub unsafe extern "C" fn drama_experts(engine: *mut DramaEngine, out_experts: *m
             return DRAMA_ERROR;
         }
     };
-    let placement = if tts.engine.model.experts == Experts::Ram { DRAMA_EXPERTS_RAM } else { DRAMA_EXPERTS_VRAM };
+    let placement = if tts.engine.model.placement == Placement::Ram { DRAMA_EXPERTS_RAM } else { DRAMA_EXPERTS_VRAM };
     let (hits, misses) = stats.unwrap_or((0, 0));
     if let Some(p) = out_experts.as_mut() {
         *p = placement;

@@ -1,8 +1,10 @@
 [package]
 name = "drama-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "Fish Audio Drama 3 text-to-speech on a single 24 GB GPU (Rust + CUDA)"
+# ntex 4 (the `serve` feature) needs 1.97
+rust-version = "1.97"
+description = "Fish Audio Drama 3 text-to-speech in Rust (CUDA or Apple Silicon MLX)"
 license = "Apache-2.0"
 repository = "https://github.com/apiplant/drama-rs"
 homepage = "https://drama-rs.apiplant.com"
@@ -10,15 +12,22 @@ readme = "README.md"
 keywords = ["text-to-speech", "tts", "cuda", "fish-audio", "voice-cloning"]
 categories = ["multimedia::audio", "science", "command-line-utilities"]
 # the crate is the engine, its CUDA kernels and the binary; weights are downloaded separately
-include = ["/src/", "/kernels/", "/build.rs", "/README.md", "/LICENSE"]
+include = ["/src/", "/kernels/", "/ui/dist/", "/build.rs", "/README.md", "/LICENSE"]
 
 [lib]
 name = "drama"
 
 [features]
-default = ["cli"]
+default = ["cuda", "cli"]
+# Preserve the existing custom CUDA engine. Select exactly one compute backend.
+cuda = []
+mlx = ["dep:mlx-rs"]
+# find the model in the usual places, else fetch it from Hugging Face into ~/.cache/drama-rs (ureq)
+download = ["dep:ureq"]
 # the `drama` command-line binary (clap). Disable default features to use drama as a library
-cli = ["dep:clap"]
+cli = ["download", "serve", "dep:clap"]
+# `drama::serve`: an HTTP server (ntex) that renders text to WAV, whole or streamed
+serve = ["dep:ntex", "dep:tokio"]
 
 [[bin]]
 name = "drama"
@@ -27,14 +36,17 @@ required-features = ["cli"]
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 half = "2"
 hound = "3.5"
 memmap2 = "0.9"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+ntex = { version = "4", features = ["tokio"], optional = true }  # default "ws" kept: ntex 4.2 does not build without it
+tokio = { version = "1", features = ["sync"], optional = true }
 
 [profile.release]
 debug = 1
@@ -44,3 +56,6 @@ debug = 1
 inherits = "release"
 debug = 0
 strip = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = { version = "=0.32.0", optional = true, features = ["safetensors"] }

@@ -69,6 +69,51 @@ function Features() {
   );
 }
 
+/* The web UI that `drama serve` embeds, in a browser-style frame. */
+function Studio() {
+  const points = [
+    ["Write dialogue", "Speaker tags and [laughs]-style tags are highlighted as you type, with one voice per speaker."],
+    ["Clone from a clip", "Drop in an audio file or record one. If fluid-speech is installed the transcript is filled in for you."],
+    ["Hear it as it renders", "Audio streams while it is generated, buffered so it keeps playing even when the GPU is slower than real time."],
+    ["Keep every take", "Waveforms, a real-time factor for each take, and one-click WAV download."],
+  ];
+  return (
+    <section id="ui" class="pb-16">
+      <h2 class="text-2xl font-semibold tracking-tight text-ink">A studio in your browser</h2>
+      <p class="mt-2 max-w-2xl text-muted">
+        <code class="font-mono text-ink">drama serve</code> comes with its own web UI, built into the binary. Open{" "}
+        <code class="font-mono text-ink">localhost:8080</code> and start talking: no extra install, no separate server.
+      </p>
+      <div class="mt-8 overflow-hidden rounded-xl border border-line shadow-2xl">
+        <div class="flex items-center gap-2 border-b border-line bg-surface px-4 py-2.5">
+          <span class="h-2.5 w-2.5 rounded-full bg-danger" />
+          <span class="h-2.5 w-2.5 rounded-full bg-warn" />
+          <span class="h-2.5 w-2.5 rounded-full bg-success" />
+          <span class="ml-2 font-mono text-xs text-faint">localhost:8080</span>
+        </div>
+        <img
+          src="/ui.webp"
+          width="2400"
+          height="1350"
+          alt="The drama web UI: a dialogue script with highlighted speaker tags, a voice library, sampling controls and two generated takes with waveforms"
+          class="block w-full"
+          loading="lazy"
+        />
+      </div>
+      <div class="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <For each={points}>
+          {([title, body]) => (
+            <div class="rounded-xl border border-line bg-surface p-5">
+              <h3 class="text-[0.9375rem] font-semibold tracking-tight text-ink">{title}</h3>
+              <p class="mt-2 text-sm leading-relaxed text-muted">{body}</p>
+            </div>
+          )}
+        </For>
+      </div>
+    </section>
+  );
+}
+
 export function Home() {
   return (
     <div class="mx-auto w-full max-w-6xl px-5">
@@ -115,6 +160,8 @@ export function Home() {
         </div>
         <TerminalDemo />
       </section>
+
+      <Studio />
 
       {/* Cards */}
       <section class="pb-16">

@@ -38,8 +38,8 @@ sudo apt update && sudo apt install ${pkg}`;
           </div>
           <h3 class="mt-3 text-base font-semibold tracking-tight text-ink">Use a package manager</h3>
           <p class="mt-2 text-sm leading-relaxed text-muted">
-            Arch Linux, Debian/Ubuntu and Homebrew on Linux, x86_64 with an NVIDIA GPU (24 GB, Ampere or newer),
-            published to the apiplant shared repositories. Then download the weights (~21 GB):{" "}
+            Arch Linux, Debian/Ubuntu and Homebrew on Linux (x86_64 with an NVIDIA GPU, 24 GB, Ampere or newer), and
+            Homebrew on Apple Silicon (macOS 15+, 32 GB or more; needs <Mono>ffmpeg</Mono>), published to the apiplant shared repositories. Then download the weights (~21 GB):{" "}
             <Mono>hf download apiplant/drama-q4 --local-dir drama-q4</Mono>.
           </p>
           <Show when={cuda}>
@@ -136,8 +136,8 @@ sudo apt update && sudo apt install ${pkg}`;
           <span class="font-mono text-xs text-faint">03</span>
           <h3 class="mt-3 text-base font-semibold tracking-tight text-ink">Cargo</h3>
           <p class="mt-2 text-sm leading-relaxed text-muted">
-            Build from source. Needs the CUDA toolkit (nvcc); set <Mono>DRAMA_CUDA_ARCH</Mono> if your GPU is not
-            sm_89.
+            Build from source. CUDA needs the toolkit (nvcc); set <Mono>DRAMA_CUDA_ARCH</Mono> if your GPU is not
+            sm_89. On Apple Silicon build with <Mono>--no-default-features --features mlx,cli</Mono>.
           </p>
         </div>
 

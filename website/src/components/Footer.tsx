@@ -57,7 +57,7 @@ export function Footer() {
             </span>
           </div>
           <p class="mt-3 max-w-xs text-sm leading-relaxed text-faint">
-            Fish Audio Drama 3 text-to-speech on one 24 GB GPU, in Rust and CUDA: voice cloning, dialogue, streaming. No PyTorch.
+            Fish Audio Drama 3 text-to-speech on one 24 GB GPU or Apple Silicon, in Rust with CUDA and MLX: voice cloning, dialogue, streaming. No PyTorch.
           </p>
         </div>
 

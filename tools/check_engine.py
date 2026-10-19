@@ -26,6 +26,7 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--work", default="test/work")
     ap.add_argument("--original", default=None, help="compare against the unquantized original checkpoint dir")
+    ap.add_argument("--experts", default="q4", choices=["q4", "fp8"], help="engine routed experts (fp8 reads --original from host RAM)")
     ap.add_argument("--rows-file", default=None, help="use these prompt rows (raw i32 [rows][11]) instead of random ones")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
@@ -49,6 +50,8 @@ def main() -> None:
         args.binary, "trace", "--model", args.model, "--rows", rows_path, "--steps", str(args.steps),
         "--out", trace_path, "--chunk", str(args.chunk), "--temperature", str(args.temperature), "--max-len", "1024",
     ]
+    if args.experts == "fp8":
+        cmd += ["--experts", "fp8", "--fp8-model", args.original]
     subprocess.run(cmd, check=True)
 
     n_cand = m.cb + 1

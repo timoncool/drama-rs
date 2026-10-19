@@ -9,6 +9,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <stdint.h>
@@ -597,6 +598,149 @@ API int dr_moe_decode(const uint8_t* gu_q, const __half2* gu_sm, const uint8_t* 
   return 0;
 }
 
+
+// ------------------------------------------------------------------------------------------
+// FP8 experts (the original checkpoint's block-FP8, e4m3, 128x128 blocks with f32 scale_inv).
+// The weights live in pinned host memory and are read over PCIe, so the kernels keep many loads in
+// flight. gate_up: W [E, 2I, K], S [E, 2I/128, K/128]; down: W [E, N, I], S [E, N/128, I/128].
+
+// 16 e4m3 bytes -> floats.
+DEV void fp8x16(const int4& w, float* f) {
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned word = (unsigned)pick4(w, i);
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const __half2 v = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)((word >> (16 * h)) & 0xffffu), __NV_E4M3));
+      const float2 p = __half22float2(v);
+      f[i * 4 + h * 2] = p.x;
+      f[i * 4 + h * 2 + 1] = p.y;
+    }
+  }
+}
+
+// One warp: dot(W[row], x) over K, x staged as float4. Rows are K bytes, scales are per 128x128 block.
+template <int K>
+DEV float dot_fp8(const uint8_t* __restrict__ W, const float* __restrict__ S, size_t row, const float4* xs4, int lane) {
+  constexpr int NI = K / 16 / 32;
+  int4 v[NI];
+  float sc[NI];
+#pragma unroll
+  for (int i = 0; i < NI; ++i) {
+    const int c = lane + 32 * i;
+    v[i] = __ldg(reinterpret_cast<const int4*>(W + row * K) + c);
+    sc[i] = __ldg(S + (row >> 7) * (K / 128) + (c >> 3));
+  }
+  float acc = 0.f;
+#pragma unroll
+  for (int i = 0; i < NI; ++i) {
+    const int c = lane + 32 * i;
+    float f[16];
+    fp8x16(v[i], f);
+    float qx = 0.f;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const float4 xv = xs4[c * 4 + t];
+      qx += f[4 * t] * xv.x + f[4 * t + 1] * xv.y + f[4 * t + 2] * xv.z + f[4 * t + 3] * xv.w;
+    }
+    acc += sc[i] * qx;
+  }
+  return warp_sum(acc);
+}
+
+template <int K>
+__global__ void __launch_bounds__(MOE_WARPS * 32)
+    k_moe_gate_up_fp8(const uint8_t* __restrict__ W, const float* __restrict__ S, const int8_t* __restrict__ shq,
+                      const __half* __restrict__ shs, const float* __restrict__ x, const int* __restrict__ idx,
+                      float* __restrict__ act, int I, int topk, const float* __restrict__ nw, float eps) {
+  __shared__ float4 xs4[K / 4];
+  stage_x_norm<K>(x, nw, eps, xs4);
+  const int k = blockIdx.y;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int j0 = (blockIdx.x * MOE_WARPS + warp) * MOE_RPW;
+  if (k == topk) {
+#pragma unroll
+    for (int r = 0; r < MOE_RPW; ++r) {
+      const int j = j0 + r;
+      if (j >= I) break;
+      const float g = dot_q8<K>(shq, shs, j, xs4, lane);
+      const float u = dot_q8<K>(shq, shs, (size_t)I + j, xs4, lane);
+      if (lane == 0) act[k * I + j] = silu(g) * u;
+    }
+    return;
+  }
+  const size_t e = idx[k];
+  const uint8_t* w = W + e * (size_t)(2 * I) * K;
+  const float* s = S + e * (size_t)(2 * I / 128) * (K / 128);
+#pragma unroll
+  for (int r = 0; r < MOE_RPW; ++r) {
+    const int j = j0 + r;
+    if (j >= I) break;
+    const float g = dot_fp8<K>(w, s, j, xs4, lane);
+    const float u = dot_fp8<K>(w, s, (size_t)I + j, xs4, lane);
+    if (lane == 0) act[k * I + j] = silu(g) * u;
+  }
+}
+
+// y[n] = res[n] + sigmoid(sgate) * shared[n] + sum_k w_k * (D_{e_k}[n] . act[k]). I = 512: a row of an
+// expert is 32 chunks of 16 bytes, one per lane.
+template <int I, int TOPK>
+__global__ void __launch_bounds__(MOE_WARPS * 32)
+    k_moe_down_fp8(const uint8_t* __restrict__ W, const float* __restrict__ S, const int8_t* __restrict__ shq,
+                   const __half* __restrict__ shs, const float* __restrict__ act, const int* __restrict__ idx,
+                   const float* __restrict__ wts, const float* __restrict__ sgate, const float* res, float* y, int N,
+                   const char* pf, size_t pf_bytes) {
+  static_assert(I == 512, "one 16-byte chunk per lane");
+  __shared__ float4 as4[(TOPK + 1) * I / 4];
+  stage_x<(TOPK + 1) * I>(act, as4);
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int n0 = (blockIdx.x * MOE_WARPS + warp) * MOE_RPW;
+  const float sg = sigmoid(sgate[0]);
+#pragma unroll
+  for (int r = 0; r < MOE_RPW; ++r) {
+    const int n = n0 + r;
+    if (n >= N) break;
+    int4 v[TOPK];
+    float sc[TOPK];
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+      const size_t e = idx[k];
+      v[k] = __ldg(reinterpret_cast<const int4*>(W + (e * N + n) * I) + lane);
+      sc[k] = __ldg(S + (e * (N / 128) + (n >> 7)) * (I / 128) + (lane >> 3));
+    }
+    float acc = 0.f;
+#pragma unroll
+    for (int k = 0; k < TOPK; ++k) {
+      float f[16];
+      fp8x16(v[k], f);
+      float qx = 0.f;
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const float4 xv = as4[k * (I / 4) + lane * 4 + t];
+        qx += f[4 * t] * xv.x + f[4 * t + 1] * xv.y + f[4 * t + 2] * xv.z + f[4 * t + 3] * xv.w;
+      }
+      acc += wts[k] * sc[k] * qx;
+    }
+    acc = warp_sum(acc);
+    const float sh = dot_q8<I>(shq, shs, n, as4 + TOPK * I / 4, lane);
+    if (lane == 0) y[n] = res[n] + sg * sh + acc;
+  }
+  prefetch_share(pf, pf_bytes);
+}
+
+API int dr_moe_decode_fp8(const uint8_t* gu_w, const float* gu_s, const uint8_t* d_w, const float* d_s,
+                          const int8_t* sgu_q, const __half* sgu_s, const int8_t* sd_q, const __half* sd_s,
+                          const float* x, const int* idx, const float* wts, const float* sgate, const float* res,
+                          float* act, float* y, int H, int I, int topk, const float* nw, float eps, const char* pf,
+                          size_t pf_bytes, cudaStream_t st) {
+  if (H != 2048 || I != 512 || topk != 8) return -1;
+  k_moe_gate_up_fp8<2048><<<dim3((I + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), topk + 1),
+                            MOE_WARPS * 32, 0, st>>>(gu_w, gu_s, sgu_q, sgu_s, x, idx, act, I, topk, nw, eps);
+  k_moe_down_fp8<512, 8><<<(H + MOE_WARPS * MOE_RPW - 1) / (MOE_WARPS * MOE_RPW), MOE_WARPS * 32, 0, st>>>(
+      d_w, d_s, sd_q, sd_s, act, idx, wts, sgate, res, y, H, pf, pf_bytes);
+  return 0;
+}
+
 // Prefill routing: count rows per expert.
 __global__ void k_moe_count(const int* __restrict__ idx, int n, int* __restrict__ counts) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1013,6 +1157,147 @@ API int dr_expert_fill(const int* idx, const int* fill, int topk, const void* g_
   k_expert_fill<<<dim3(32, topk), 256, 0, st>>>(
       idx, fill, (const int4*)g_q, (const int4*)g_sm, (const int4*)d_q, (const int4*)d_sm, (int4*)c_gq, (int4*)c_gsm,
       (int4*)c_dq, (int4*)c_dsm, b_gq / 16, b_gsm / 16, b_dq / 16, b_dsm / 16);
+  return 0;
+}
+
+
+// FP8 prefill, grouped by expert like the int4 kernels above.
+__global__ void __launch_bounds__(256)
+    k_moe_pf_gate_up_fp8(const uint8_t* __restrict__ W, const float* __restrict__ S, const bf16* __restrict__ xp,
+                         const int* __restrict__ offsets, const int* __restrict__ counts, bf16* __restrict__ act, int I) {
+  constexpr int K = 2048, NCH = K / 16, PAIRS_PER_WARP = 4;
+  __shared__ __align__(16) bf16 xs[PF_TT * K];
+  const int e = blockIdx.x;
+  const int cnt = counts[e];
+  if (cnt == 0) return;
+  const int off = offsets[e];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const uint8_t* w = W + (size_t)e * 2 * I * K;
+  const float* s = S + (size_t)e * (2 * I / 128) * (K / 128);
+  const int j0 = (blockIdx.y * 8 + warp) * PAIRS_PER_WARP;
+  for (int t0 = 0; t0 < cnt; t0 += PF_TT) {
+    const int nt = min(PF_TT, cnt - t0);
+    __syncthreads();
+    for (int i = threadIdx.x; i < PF_TT * K / 8; i += blockDim.x) {
+      const int tt = i / (K / 8);
+      int4 v = make_int4(0, 0, 0, 0);
+      if (tt < nt) v = reinterpret_cast<const int4*>(xp + (size_t)(off + t0 + tt) * K)[i % (K / 8)];
+      reinterpret_cast<int4*>(xs)[i] = v;
+    }
+    __syncthreads();
+    for (int pj = 0; pj < PAIRS_PER_WARP; ++pj) {
+      const int j = j0 + pj;
+      if (j >= I) break;
+      float ag[PF_TT], au[PF_TT];
+#pragma unroll
+      for (int tt = 0; tt < PF_TT; ++tt) ag[tt] = au[tt] = 0.f;
+#pragma unroll
+      for (int ci = 0; ci < NCH / 32; ++ci) {
+        const int c = lane + 32 * ci;
+#pragma unroll
+        for (int which = 0; which < 2; ++which) {
+          const size_t row = which ? (size_t)I + j : (size_t)j;
+          const int4 wv = __ldg(reinterpret_cast<const int4*>(w + row * K) + c);
+          const float sc = __ldg(s + (row >> 7) * (K / 128) + (c >> 3));
+          float f[16];
+          fp8x16(wv, f);
+#pragma unroll
+          for (int tt = 0; tt < PF_TT; ++tt) {
+            if (tt < nt) {
+              const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(xs + tt * K + c * 16);
+              float qx = 0.f;
+#pragma unroll
+              for (int v = 0; v < 8; ++v) {
+                const float2 xv = __bfloat1622float2(x2[v]);
+                qx += f[2 * v] * xv.x + f[2 * v + 1] * xv.y;
+              }
+              if (which) au[tt] += sc * qx; else ag[tt] += sc * qx;
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int tt = 0; tt < PF_TT; ++tt) {
+        if (tt < nt) {
+          const float g = warp_sum(ag[tt]), u = warp_sum(au[tt]);
+          if (lane == 0) act[(size_t)(off + t0 + tt) * I + j] = __float2bfloat16(silu(g) * u);
+        }
+      }
+    }
+  }
+}
+
+// K = I = 512: 32 chunks of 16 bytes per row, two per lane of a half-warp.
+__global__ void __launch_bounds__(256)
+    k_moe_pf_down_fp8(const uint8_t* __restrict__ W, const float* __restrict__ S, const bf16* __restrict__ act,
+                      const int* __restrict__ offsets, const int* __restrict__ counts, float* __restrict__ y, int N) {
+  constexpr int K = 512, ROWS_PER_HALF = 4;
+  __shared__ __align__(16) bf16 xs[PF_TT * K];
+  const int e = blockIdx.x;
+  const int cnt = counts[e];
+  if (cnt == 0) return;
+  const int off = offsets[e];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int half = lane >> 4, hl = lane & 15;
+  const uint8_t* w = W + (size_t)e * N * K;
+  const float* s = S + (size_t)e * (N / 128) * (K / 128);
+  const int n0 = ((blockIdx.y * 8 + warp) * 2 + half) * ROWS_PER_HALF;
+  for (int t0 = 0; t0 < cnt; t0 += PF_TT) {
+    const int nt = min(PF_TT, cnt - t0);
+    __syncthreads();
+    for (int i = threadIdx.x; i < PF_TT * K / 8; i += blockDim.x) {
+      const int tt = i / (K / 8);
+      int4 v = make_int4(0, 0, 0, 0);
+      if (tt < nt) v = reinterpret_cast<const int4*>(act + (size_t)(off + t0 + tt) * K)[i % (K / 8)];
+      reinterpret_cast<int4*>(xs)[i] = v;
+    }
+    __syncthreads();
+    for (int r = 0; r < ROWS_PER_HALF; ++r) {
+      const int n = n0 + r;
+      const bool valid = n < N;
+      float acc[PF_TT];
+#pragma unroll
+      for (int tt = 0; tt < PF_TT; ++tt) acc[tt] = 0.f;
+      if (valid) {
+#pragma unroll
+        for (int ci = 0; ci < 2; ++ci) {
+          const int c = hl + 16 * ci;
+          const int4 wv = __ldg(reinterpret_cast<const int4*>(w + (size_t)n * K) + c);
+          const float sc = __ldg(s + (size_t)(n >> 7) * (K / 128) + (c >> 3));
+          float f[16];
+          fp8x16(wv, f);
+#pragma unroll
+          for (int tt = 0; tt < PF_TT; ++tt) {
+            if (tt < nt) {
+              const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(xs + tt * K + c * 16);
+              float qx = 0.f;
+#pragma unroll
+              for (int v = 0; v < 8; ++v) {
+                const float2 xv = __bfloat1622float2(x2[v]);
+                qx += f[2 * v] * xv.x + f[2 * v + 1] * xv.y;
+              }
+              acc[tt] += sc * qx;
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int tt = 0; tt < PF_TT; ++tt) {
+        float v = acc[tt];
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (valid && hl == 0 && tt < nt) y[(size_t)(off + t0 + tt) * N + n] = v;
+      }
+    }
+  }
+}
+
+API int dr_moe_prefill_fp8(const uint8_t* gu_w, const float* gu_s, const uint8_t* d_w, const float* d_s,
+                           const bf16* xp, const int* offsets, const int* counts, bf16* act, float* y, int E, int H,
+                           int I, cudaStream_t st) {
+  if (H != 2048 || I != 512) return -1;
+  k_moe_pf_gate_up_fp8<<<dim3(E, (I + 31) / 32), 256, 0, st>>>(gu_w, gu_s, xp, offsets, counts, act, I);
+  k_moe_pf_down_fp8<<<dim3(E, (H + 63) / 64), 256, 0, st>>>(d_w, d_s, act, offsets, counts, y, H);
   return 0;
 }
 

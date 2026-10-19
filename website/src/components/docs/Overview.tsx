@@ -67,10 +67,15 @@ export function DocsOverview() {
       <Section>
         <H2>Requirements</H2>
         <UL>
-          <LI>An NVIDIA GPU with 24 GB of memory: Ampere or newer (A10, 3090, 4090, L40, A100, H100, 5090).</LI>
-          <LI>Linux x86_64 with a driver for CUDA 12 (the release builds) or your own toolkit (source builds).</LI>
+          <LI>CUDA: an NVIDIA GPU with 24 GB of memory, Ampere or newer (A10, 3090, 4090, L40, A100, H100, 5090).</LI>
+          <LI>CUDA: Linux x86_64 with a driver for CUDA 12 (the release builds) or your own toolkit (source builds).</LI>
           <LI>
-            <IC>pw-play</IC> (PipeWire) for <IC>--play</IC>.
+            Apple Silicon (MLX): macOS 15 or newer and 32 GB or more of unified memory. Experts run as int4 (
+            <IC>--experts auto</IC> selects <IC>q4</IC>); the FP8 expert placement options are CUDA-only. Throughput has not been measured
+            on a Mac yet.
+          </LI>
+          <LI>
+            <IC>pw-play</IC> (PipeWire) on Linux, or <IC>ffplay</IC> (FFmpeg) on macOS, for <IC>--play</IC>.
           </LI>
         </UL>
       </Section>

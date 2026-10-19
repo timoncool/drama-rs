@@ -48,6 +48,15 @@ extern "C" {
         sd_s: *const Half, x: *const f32, idx: *const i32, wts: *const f32, sgate: *const f32, res: *const f32, act: *mut f32, y: *mut f32,
         h: i32, i: i32, topk: i32, nw: *const f32, eps: f32, pf: *const c_char, pf_bytes: usize, st: Stream,
     ) -> i32;
+    pub fn dr_moe_decode_fp8(
+        gu_w: *const u8, gu_s: *const f32, d_w: *const u8, d_s: *const f32, sgu_q: *const i8, sgu_s: *const Half, sd_q: *const i8,
+        sd_s: *const Half, x: *const f32, idx: *const i32, wts: *const f32, sgate: *const f32, res: *const f32, act: *mut f32, y: *mut f32,
+        h: i32, i: i32, topk: i32, nw: *const f32, eps: f32, pf: *const c_char, pf_bytes: usize, st: Stream,
+    ) -> i32;
+    pub fn dr_moe_prefill_fp8(
+        gu_w: *const u8, gu_s: *const f32, d_w: *const u8, d_s: *const f32, xp: *const Bf16, offsets: *const i32, counts: *const i32,
+        act: *mut Bf16, y: *mut f32, e: i32, h: i32, i: i32, st: Stream,
+    ) -> i32;
     pub fn dr_router_topk(
         w: *const Bf16, x: *const f32, nw: *const f32, eps: f32, logits: *mut f32, e: i32, topk: i32, k: i32, idx: *mut i32, wts: *mut f32,
         sgate: *mut f32, counter: *mut u32, gu_q: *const c_char, gu_sm: *const c_char, d_q: *const c_char, d_sm: *const c_char, gu_q_b: usize,

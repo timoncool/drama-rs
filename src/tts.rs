@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 
 use crate::codec::{self, Codec};
 use crate::engine::{Engine, SampleParams};
-use crate::model::{Experts, Model};
+use crate::model::{ExpertMode, Model};
 use crate::prompt::{self, Reference};
 
 /// VRAM left to other programs when the engine sizes itself to the free VRAM: a sixteenth of it, 256 MiB to 1 GiB.
@@ -65,6 +65,11 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let child = Command::new("ffplay")
+            .args(["-nodisp", "-autoexit", "-loglevel", "error", "-f", "f32le", "-ar", &codec::SAMPLE_RATE.to_string(), "-ac", "1", "-i", "pipe:0"])
+            .stdin(Stdio::piped()).spawn().context("starting ffplay for --play (install ffmpeg)")?;
+        #[cfg(not(target_os = "macos"))]
         let child = Command::new("pw-play")
             .args(["--raw", "--rate", &codec::SAMPLE_RATE.to_string(), "--channels", "1", "--format", "f32", "-"])
             .stdin(Stdio::piped())
@@ -89,31 +94,51 @@ impl Player {
 
 impl Tts {
     pub fn load(model_dir: &Path, max_len: usize, chunk: usize) -> Result<Self> {
-        Self::load_with(model_dir, max_len, chunk, 0)
+        Self::load_with(model_dir, max_len, chunk, &ExpertMode::Q4)
     }
 
-    /// `vram_limit`: most VRAM the engine takes, codec included (0: the whole model if it fits in the free VRAM, else
-    /// what is free less `auto_margin`). The routed experts stay on the GPU when the whole model fits the limit; otherwise
-    /// they live in RAM and an expert cache takes what the limit leaves. The output is the same either way, a larger
-    /// cache only makes it faster.
-    pub fn load_with(model_dir: &Path, max_len: usize, chunk: usize, vram_limit: usize) -> Result<Self> {
-        let (free0, _) = crate::gpu::mem_info()?;
-        let fit_limit = if vram_limit == 0 { free0 } else { vram_limit };
-        let limit = if vram_limit == 0 { free0.saturating_sub(auto_margin(free0)) } else { vram_limit };
-        let codec_path = model_dir.join("codec.safetensors");
-        let (enc_bytes, dec_bytes) = Codec::sizes(&codec_path)?;
+    #[cfg(not(feature = "mlx"))]
+    /// The int4 experts on the GPU when the whole model fits `vram_limit` bytes (0: the free VRAM), else in RAM with a
+    /// VRAM expert cache ([`ExpertMode::Q4Ram`]).
+    pub fn fitting(model_dir: &Path, vram_limit: usize) -> Result<ExpertMode> {
+        let fit_limit = if vram_limit == 0 { crate::gpu::mem_info()?.0 } else { vram_limit };
+        let (enc_bytes, dec_bytes) = Codec::sizes(&model_dir.join("codec.safetensors"))?;
         let whole = enc_bytes + dec_bytes + crate::model::full_vram(model_dir)? <= fit_limit as u64;
-        let experts = if whole { Experts::Vram } else { Experts::Ram };
-        let codec = Codec::load(&codec_path, !whole)?;
+        Ok(if whole { ExpertMode::Q4 } else { ExpertMode::Q4Ram { vram_limit } })
+    }
+
+    /// [`Tts::load`] with the routed experts from `experts` (int4 on the GPU or in host RAM, or the original FP8 in host
+    /// RAM).
+    pub fn load_with(model_dir: &Path, max_len: usize, chunk: usize, experts: &ExpertMode) -> Result<Self> {
+        let (engine, codec) = match experts {
+            #[cfg(not(feature = "mlx"))]
+            ExpertMode::Q4Ram { vram_limit } => Self::load_offloaded(model_dir, max_len, chunk, *vram_limit, experts)?,
+            _ => {
+                let codec = Codec::load(&model_dir.join("codec.safetensors"))?;
+                let st = crate::gpu::Stream::new()?;
+                let model = Model::load_with(model_dir, &st, experts)?;
+                (Engine::new(model, max_len, chunk)?, codec)
+            }
+        };
+        let tok = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
+        Ok(Self { engine, codec, tok })
+    }
+
+    #[cfg(not(feature = "mlx"))]
+    /// The experts in RAM: the codec's encoder stays in RAM too, and what `vram_limit` leaves after the weights and the
+    /// codec's working memory goes to the expert cache.
+    fn load_offloaded(model_dir: &Path, max_len: usize, chunk: usize, vram_limit: usize, experts: &ExpertMode) -> Result<(Engine, Codec)> {
+        let (free0, _) = crate::gpu::mem_info()?;
+        let limit = if vram_limit == 0 { free0.saturating_sub(auto_margin(free0)) } else { vram_limit };
+        let codec = Codec::load_with(&model_dir.join("codec.safetensors"), true)?;
         let st = crate::gpu::Stream::new()?;
         let (free1, _) = crate::gpu::mem_info()?;
         let codec_vram = free0.saturating_sub(free1);
-        let model = Model::load(model_dir, &st, experts)?;
-        // what the limit leaves after everything loaded so far, less the codec's working memory, goes to the cache
+        let model = Model::load_with(model_dir, &st, experts)?;
         let (free2, _) = crate::gpu::mem_info()?;
         let used = free0.saturating_sub(free2);
         let keep_free = free2.saturating_sub(limit.saturating_sub(used)) + CODEC_WORK;
-        let engine = Engine::new(model, max_len, chunk, keep_free)?;
+        let engine = Engine::with_cache(model, max_len, chunk, keep_free)?;
         let (free3, _) = crate::gpu::mem_info()?;
         let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
         eprintln!(
@@ -122,14 +147,18 @@ impl Tts {
             gib(used.saturating_sub(codec_vram)),
             gib(free2.saturating_sub(free3))
         );
-        let tok = Tokenizer::from_file(model_dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        Ok(Self { engine, codec, tok })
+        Ok((engine, codec))
     }
 
     /// Encode a reference clip (any rate, mixed to mono) for voice cloning.
     pub fn reference(&self, wav: &Path, transcript: &str) -> Result<Reference> {
         let (audio, sr) = codec::read_wav(wav)?;
-        let audio = codec::resample(&audio, sr, codec::SAMPLE_RATE);
+        self.reference_audio(&audio, sr, transcript)
+    }
+
+    /// [`Tts::reference`] from mono samples at `sr` Hz.
+    pub fn reference_audio(&self, audio: &[f32], sr: u32, transcript: &str) -> Result<Reference> {
+        let audio = codec::resample(audio, sr, codec::SAMPLE_RATE);
         let flat = self.codec.encode(&audio)?;
         let frames = flat.len() / 10;
         let codes = (0..10).map(|c| (0..frames).map(|t| flat[t * 10 + c]).collect()).collect();

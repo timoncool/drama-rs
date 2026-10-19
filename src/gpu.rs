@@ -206,6 +206,8 @@ pub struct Pinned<T: Copy> {
     len: usize,
 }
 
+unsafe impl<T: Copy> Send for Pinned<T> {}
+
 impl<T: Copy> Pinned<T> {
     pub fn new(len: usize) -> Result<Self> {
         let mut p = std::ptr::null_mut();
@@ -220,6 +222,14 @@ impl<T: Copy> Pinned<T> {
 
     pub fn ptr(&self) -> *mut T {
         self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 

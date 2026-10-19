@@ -1,8 +1,7 @@
 # Packaging
 
-One package, `drama-rs`, carrying the `drama` binary. drama is CUDA-only, so
-every package is Linux x86_64 and needs an NVIDIA GPU with 24 GB (Ampere or
-newer). The `packages`, `homebrew`, `apt` and `pacman` jobs in
+One package, `drama-rs`, carrying the `drama` binary. Linux x86_64 packages use CUDA and
+need an NVIDIA GPU with 24 GB (Ampere or newer). Apple Silicon archives use MLX on macOS 15+. The `packages`, `homebrew`, `apt` and `pacman` jobs in
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) substitute
 the `@VERSION@`, `@SHA_*@`, `@ARCH@` and `@ARCHIVE_PREFIX@` placeholders with
 the tag's version and the checksums of the archives that release just built,
@@ -12,7 +11,7 @@ publishes the crate (library + binary) with `cargo publish`.
 
 | File | Publishes to |
 | --- | --- |
-| `homebrew/drama-rs.rb` | `apiplant/homebrew-tap`, as `Formula/drama-rs.rb` (Linux x86_64) |
+| `homebrew/drama-rs.rb` | `apiplant/homebrew-tap`, as `Formula/drama-rs.rb` (Linux x86_64 and macOS arm64) |
 | `pacman/PKGBUILD` | the release itself, as a `.pkg.tar.zst` asset, and `apiplant/pacman` |
 | `debian/control` | the release itself, as a `.deb` asset, and `apiplant/apt` |
 | `apt/apt-ftparchive.conf` | `apiplant/apt`, served at `apt.apiplant.com` |
@@ -29,6 +28,10 @@ absent is skipped rather than failing the release.
 
 ## Builds
 
+- `ui`: `pnpm build` in `ui/`, uploaded as the `ui-dist` artifact. `binary`,
+  `binary-arch` and `crates-io` download it into `ui/dist` before building, and
+  `DRAMA_REQUIRE_UI=1` makes build.rs fail instead of embedding no web UI. The
+  crate ships `ui/dist`, so `cargo install` gets the UI without Node.
 - `binary`: an `nvidia/cuda:12.8.1-devel-ubuntu22.04` container (nvcc and the
   CUDA libraries, no GPU needed), `cargo build --profile dist` for
   `DRAMA_CUDA_ARCH=sm_80,sm_86,sm_89,sm_90,sm_120` (machine code for each, PTX
@@ -78,3 +81,15 @@ sudo apt update && sudo apt install drama-rs
 ```
 
 Then fetch the weights (~21 GB): `hf download apiplant/drama-q4 --local-dir drama-q4`.
+
+## Apple Silicon archives
+
+The native `macos-15` job follows the `fluid-speech-rs` packaging convention: a target-named
+`drama-rs-vVERSION-aarch64-apple-darwin.tar.gz` with a matching `.sha256` file, CLI `--version` smoke test,
+and Homebrew `on_macos` / `on_arm` URL and checksum. It also runs the MLX library tests. Linux CUDA,
+Debian, Arch and repository publication retain their existing paths.
+
+MLX's native library is statically linked, but GPU execution also requires `mlx.metallib`. The job sets
+`MLX_RS_METAL_PATH` to a workspace directory and packages its generated `mlx.metallib` alongside `drama`.
+The runtime resolves the adjacent file before initializing Metal; the formula instead installs it under
+`share/drama-rs`. This avoids depending on the build runner's home directory after installation.

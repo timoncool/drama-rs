@@ -4,7 +4,7 @@ name: release
 #
 #   git tag v0.x.0 && git push origin v0.x.0
 #
-# drama is CUDA-only, so there is one platform: Linux x86_64. That builds the
+# Linux x86_64 retains CUDA; Apple Silicon uses MLX. This builds the
 # `drama` binary (in a CUDA 12 container, and again inside Arch against Arch's
 # own CUDA), attaches the archives, checksums and distro packages to the GitHub
 # release, and publishes the Homebrew formula, the apt and pacman repos and the
@@ -31,12 +31,92 @@ env:
   # architecture (A10/3090 sm_86, 4090/L40 sm_89, A100 sm_80, H100 sm_90,
   # 5090 sm_120) plus PTX of the newest, instead of asking nvidia-smi.
   DRAMA_CUDA_ARCH: "sm_80,sm_86,sm_89,sm_90,sm_120"
+  # build.rs embeds ui/dist in the binary; fail rather than ship one without the web UI.
+  DRAMA_REQUIRE_UI: "1"
 
 jobs:
+  # The web UI `drama serve` embeds at /. Built once; every cargo build below
+  # downloads it into ui/dist first.
+  ui:
+    name: web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  # Apple Silicon packaging follows fluid-speech-rs: native build, smoke test,
+  # target-named tarball and SHA-256. MLX also needs its runtime Metal library.
+  binary-macos:
+    name: aarch64-apple-darwin (mlx)
+    needs: ui
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin-mlx
+      - name: Install build dependencies
+        run: brew list cmake >/dev/null || brew install cmake
+      - name: Build
+        run: cargo build --profile dist --locked --target aarch64-apple-darwin --no-default-features --features mlx,cli --bin drama
+      - name: Smoke test
+        run: |
+          target/aarch64-apple-darwin/dist/drama --version
+          cargo test --profile dist --locked --target aarch64-apple-darwin --no-default-features --features mlx,cli --lib
+      - name: Package
+        shell: bash
+        run: |
+          name="drama-rs-${TAG}-aarch64-apple-darwin"
+          mkdir "$name"
+          cp target/aarch64-apple-darwin/dist/drama README.md LICENSE "$name/"
+          test -s "$MLX_RS_METAL_PATH/mlx.metallib"
+          cp "$MLX_RS_METAL_PATH/mlx.metallib" "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-aarch64-apple-darwin
+          path: |
+            drama-rs-*.tar.gz
+            drama-rs-*.tar.gz.sha256
+          if-no-files-found: error
+
   # nvcc and the CUDA headers/libraries are needed at build time, not a GPU;
   # the devel image provides them. 12.8 is the first toolkit with sm_120.
   binary:
     name: x86_64-unknown-linux-gnu (cuda)
+    needs: ui
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04
     env:
@@ -48,6 +128,11 @@ jobs:
           apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
 
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Install Rust
         run: |
@@ -90,6 +175,7 @@ jobs:
   # keeps the link and the `cuda` dependency in step.
   binary-arch:
     name: x86_64-unknown-linux-gnu (cuda, arch)
+    needs: ui
     runs-on: ubuntu-latest
     # Rolling Arch can break a CUDA build before anything in this repository
     # changes; the Arch package then falls back to the generic archive instead
@@ -101,6 +187,11 @@ jobs:
         run: pacman -Sy --noconfirm --needed rust cuda git
 
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
 
       - name: Build
         shell: bash
@@ -242,8 +333,8 @@ jobs:
 
   release:
     name: publish release
-    needs: [binary, binary-arch, packages]
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.packages.result == 'success' }}
+    needs: [binary, binary-macos, binary-arch, packages]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.packages.result == 'success' && needs.binary-macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -272,7 +363,10 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            `drama` needs an NVIDIA GPU with 24 GB of memory (Ampere or newer), a driver
+            Apple Silicon (macOS 15+): `drama-rs-${{ env.TAG }}-aarch64-apple-darwin.tar.gz`
+            uses MLX and unified memory. Keep `mlx.metallib` beside `drama` when unpacking.
+
+            The Linux `drama` build needs an NVIDIA GPU with 24 GB of memory (Ampere or newer), a driver
             compatible with CUDA 12, and the int4 weights (~21 GB):
 
             ```
@@ -315,7 +409,7 @@ jobs:
             sudo pacman -Sy drama-rs
             ```
 
-            ## Homebrew (Linux x86_64)
+            ## Homebrew (Linux x86_64, macOS arm64)
 
             ```
             brew install apiplant/tap/drama-rs
@@ -334,7 +428,7 @@ jobs:
   # it, and the build script runs nvcc, so this runs in the CUDA container too.
   crates-io:
     name: crates.io
-    needs: release
+    needs: [ui, release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     container: nvidia/cuda:12.8.1-devel-ubuntu22.04
@@ -350,6 +444,11 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -357,7 +456,8 @@ jobs:
 
       - name: Publish
         if: env.CARGO_REGISTRY_TOKEN != ''
-        run: cargo publish --locked
+        # ui/dist is built above and gitignored, but Cargo.toml `include`s it, so cargo sees it as uncommitted
+        run: cargo publish --locked --allow-dirty
 
   # The formula points at the release archive by URL, so it publishes after
   # the release exists. Guarded on its credential: a fork, or this repository
@@ -375,14 +475,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          name: binary-x86_64-unknown-linux-gnu
+          pattern: binary-*
+          merge-multiple: true
 
       - name: Render the formula
         if: env.TAP_TOKEN != ''
         run: |
           version="${GITHUB_REF_NAME#v}"
           sha=$(shasum -a 256 "dist/drama-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)
-          sed -e "s/@VERSION@/$version/g" -e "s/@SHA_LINUX_X86_64@/$sha/" \
+          mac_sha=$(shasum -a 256 "dist/drama-rs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA_LINUX_X86_64@/$sha/" -e "s/@SHA_MACOS_ARM64@/$mac_sha/" \
             packaging/homebrew/drama-rs.rb > /tmp/drama-rs.rb
           if grep -qE '@[A-Z_]+@' /tmp/drama-rs.rb; then
             echo "::error::unsubstituted placeholder in the formula" >&2

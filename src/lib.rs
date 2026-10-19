@@ -1,4 +1,4 @@
-//! Fish Audio Drama 3 text-to-speech on a single 24 GB GPU, in Rust + CUDA.
+//! Fish Audio Drama 3 text-to-speech with CUDA or MLX on Apple Silicon.
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
@@ -15,11 +15,37 @@
 //! # Ok(()) }
 //! ```
 
+mod config;
+mod audio_io;
+#[cfg(not(feature = "mlx"))]
 pub mod codec;
+#[cfg(feature = "mlx")]
+#[path = "mlx/codec.rs"]
+pub mod codec;
+#[cfg(feature = "mlx")]
+pub mod apple;
+#[cfg(feature = "download")]
+pub mod download;
+#[cfg(not(feature = "mlx"))]
 pub mod cpu_moe;
+#[cfg(not(feature = "mlx"))]
 pub mod engine;
+#[cfg(feature = "mlx")]
+#[path = "mlx/engine.rs"]
+pub mod engine;
+#[cfg(not(feature = "mlx"))]
 pub mod ffi;
+#[cfg(not(feature = "mlx"))]
 pub mod gpu;
+#[cfg(feature = "mlx")]
+#[path = "mlx/gpu.rs"]
+pub mod gpu;
+#[cfg(not(feature = "mlx"))]
+pub mod model;
+#[cfg(feature = "mlx")]
+#[path = "mlx/model.rs"]
 pub mod model;
 pub mod prompt;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod tts;
