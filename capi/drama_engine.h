@@ -48,6 +48,12 @@ typedef void (*DramaChunkFn)(const float *audio, size_t len, void *user);
 int32_t drama_speak_stream(DramaEngine *engine, const char *text, const char *ref_wav, const char *ref_text,
                            const DramaParams *params, DramaChunkFn on_chunk, void *user, float **out_audio,
                            size_t *out_len);
+/* A scene of several speakers in one generation: every line of `text` starts with <|speaker:N|>, voice N is ref_wavs[N]
+ * with its exact transcript ref_texts[N] (n_voices 1..16). The model hears each earlier line, so the scene sounds
+ * like one conversation; params->max_new caps the frames of the whole scene. Output as drama_speak_stream. */
+int32_t drama_speak_scene(DramaEngine *engine, const char *text, const char *const *ref_wavs, const char *const *ref_texts,
+                          uint32_t n_voices, const DramaParams *params, DramaChunkFn on_chunk, void *user,
+                          float **out_audio, size_t *out_len);
 void drama_free_audio(float *audio, size_t len);
 void drama_cancel(DramaEngine *engine);
 

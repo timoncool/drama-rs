@@ -202,6 +202,39 @@ pub unsafe extern "C" fn drama_speak_stream(
     }, out_audio, out_len)
 }
 
+/// # Safety
+/// `engine` is live; `text` and the `n_voices` strings of `ref_wavs` and `ref_texts` are NUL-terminated UTF-8; `params`,
+/// `out_audio` and `out_len` are valid; `on_chunk` (may be null) is safe to call from another thread with `user`.
+///
+/// A scene of several speakers in one generation: every line of `text` starts with `<|speaker:N|>`, and voice N is
+/// `ref_wavs[N]` with its exact transcript `ref_texts[N]` (N below 16). The model hears each earlier line, so the scene
+/// sounds like one conversation; `params.max_new` caps the frames of the whole scene.
+#[no_mangle]
+pub unsafe extern "C" fn drama_speak_scene(
+    engine: *mut DramaEngine, text: *const c_char, ref_wavs: *const *const c_char, ref_texts: *const *const c_char, n_voices: u32,
+    params: *const DramaParams, on_chunk: DramaChunkFn, user: *mut c_void, out_audio: *mut *mut f32, out_len: *mut usize,
+) -> i32 {
+    let voices = || -> Result<Vec<(String, String)>, String> {
+        if n_voices == 0 || n_voices > 16 || ref_wavs.is_null() || ref_texts.is_null() {
+            return Err(format!("a scene takes 1 to 16 voices, got {n_voices}"));
+        }
+        (0..n_voices as usize)
+            .map(|i| {
+                let wav = text_arg(*ref_wavs.add(i), "ref_wav")?;
+                let transcript = text_arg(*ref_texts.add(i), "ref_text")?;
+                let tagged = if transcript.trim_start().starts_with("<|speaker:") { transcript } else { format!("<|speaker:{i}|> {transcript}") };
+                Ok((wav, tagged))
+            })
+            .collect()
+    };
+    let user = UserPtr(user);
+    run(engine, text, voices, false, params, move |a: &[f32]| {
+        if let Some(f) = on_chunk {
+            f(a.as_ptr(), a.len(), user.get());
+        }
+    }, out_audio, out_len)
+}
+
 #[derive(Clone, Copy)]
 struct UserPtr(*mut c_void);
 unsafe impl Send for UserPtr {}
@@ -215,7 +248,18 @@ impl UserPtr {
 #[allow(clippy::too_many_arguments)]
 unsafe fn speak(
     engine: *mut DramaEngine, text: *const c_char, ref_wav: *const c_char, ref_text: *const c_char, params: *const DramaParams,
-    mut on_chunk: impl FnMut(&[f32]) + Send, out_audio: *mut *mut f32, out_len: *mut usize,
+    on_chunk: impl FnMut(&[f32]) + Send, out_audio: *mut *mut f32, out_len: *mut usize,
+) -> i32 {
+    let voices = || -> Result<Vec<(String, String)>, String> { Ok(vec![(text_arg(ref_wav, "ref_wav")?, text_arg(ref_text, "ref_text")?)]) };
+    run(engine, text, voices, true, params, on_chunk, out_audio, out_len)
+}
+
+/// Speaks `text` with `voices` (reference wav and its transcript): sentence by sentence with `split`, else in one
+/// generation that hears every earlier line.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run(
+    engine: *mut DramaEngine, text: *const c_char, voices: impl FnOnce() -> Result<Vec<(String, String)>, String>, split: bool,
+    params: *const DramaParams, mut on_chunk: impl FnMut(&[f32]) + Send, out_audio: *mut *mut f32, out_len: *mut usize,
 ) -> i32 {
     let Some(engine) = engine.as_ref() else {
         set_error("engine is null");
@@ -229,20 +273,19 @@ unsafe fn speak(
     let spoken = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<f32>, (i32, String)> {
         let fail = |e: String| (DRAMA_ERROR, e);
         let text = text_arg(text, "text").map_err(fail)?;
-        let wav = text_arg(ref_wav, "ref_wav").map_err(fail)?;
-        let transcript = text_arg(ref_text, "ref_text").map_err(fail)?;
+        let voices = voices().map_err(fail)?;
         let mut tts = engine.tts.lock().unwrap_or_else(|p| p.into_inner());
         engine.stop.store(false, Ordering::Relaxed);
-        let voice = reference(engine, &tts, &wav, &transcript).map_err(fail)?;
+        let refs = voices.iter().map(|(wav, transcript)| reference(engine, &tts, wav, transcript)).collect::<Result<Vec<_>, _>>().map_err(fail)?;
         let opts = SpeakOpts {
             params: SampleParams { temperature: p.temperature, top_k: p.top_k, top_p: p.top_p, pad: 0, seed: p.seed },
             max_new: p.max_new.max(1) as usize,
             first_chunk: 16,
             chunk: 16,
-            split: true,
+            split,
             keep_stalled: false,
         };
-        let result = tts.speak(&text, &[voice], &opts, |a| {
+        let result = tts.speak(&text, &refs, &opts, |a| {
             on_chunk(a);
             Ok(())
         });
