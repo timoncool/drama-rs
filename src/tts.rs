@@ -37,6 +37,11 @@ pub struct SpeakOpts {
 pub struct Spoken {
     pub audio: Vec<f32>,
     pub frames: Vec<Vec<i32>>,
+    /// Any sentence stalled (its streamed audio contains the stall drone;
+    /// `frames` holds only successful attempts — re-decode for a clean file).
+    pub had_stall: bool,
+    /// 0-based indices of sentences kept stalled (all attempts failed).
+    pub kept_stalled: Vec<usize>,
     /// Prompt rows prefilled, over all sentences.
     pub prompt_rows: usize,
     /// The first sentence's prompt rows [rows][1 + num_codebooks].
@@ -155,6 +160,8 @@ impl Tts {
                 let mut frames = Vec::new();
                 let mut prompt_rows = 0;
                 let mut first_prompt = Vec::new();
+                let mut had_stall = false;
+                let mut kept_stalled: Vec<usize> = Vec::new();
                 // The given references, then each unreferenced speaker's first sentence.
                 let mut voices: Vec<Reference> = refs.to_vec();
                 let mut voiced: Vec<u32> = covered;
@@ -166,22 +173,41 @@ impl Tts {
                     }
                     let cap = if opts.split { frame_cap(seg) } else { usize::MAX };
                     // A sentence that runs into its cap has stalled (silence with no end); its
-                    // audio is already out, so say it again with another seed rather than drop it.
+                    // audio is already out to the stream, so say it again with another seed.
+                    // Stalled attempts stay out of `frames`: --out re-decodes frames offline
+                    // for a clean file (the streamed audio keeps them, it can't be taken back).
                     let mut seg_frames = Vec::new();
                     let mut stalled = true;
+                    let mut saw_empty = false;
                     for attempt in 0..=STALL_RETRIES {
                         let mut params = opts.params;
                         params.seed = params.seed.wrapping_add(i as u64).wrapping_add(attempt as u64 * 1000);
                         seg_frames = engine.generate(&rows, params, opts.max_new.min(cap), |frame| {
                             let _ = tx.send(frame[1..].to_vec());
                         })?;
-                        stalled = seg_frames.len() >= cap;
+                        let empty = seg_frames.is_empty();
+                        saw_empty |= empty;
+                        stalled = seg_frames.len() >= cap || empty;
+                        let pushed_ref = matches!(prompt::sole_speaker(seg), Some(sp) if opts.split && !stalled && !seg_frames.is_empty() && !voiced.contains(&sp));
+                        eprintln!(
+                            "segment {} attempt {} seed={} {}={} frames={} ref_pushed={}",
+                            i,
+                            attempt + 1,
+                            params.seed,
+                            if empty { "empty" } else { "stalled" },
+                            stalled,
+                            seg_frames.len(),
+                            pushed_ref as u8
+                        );
                         if !stalled {
                             break;
                         }
-                        // Its audio was played, so it stays in the output.
-                        frames.extend(seg_frames.drain(..));
-                        eprintln!("sentence {} ran into its {cap}-frame cap without ending (attempt {})", i + 1, attempt + 1);
+                        had_stall = true;
+                        if empty {
+                            eprintln!("sentence {} generated nothing (instant EOS) (attempt {})", i + 1, attempt + 1);
+                        } else {
+                            eprintln!("sentence {} ran into its {cap}-frame cap without ending (attempt {})", i + 1, attempt + 1);
+                        }
                     }
                     if let Some(sp) = prompt::sole_speaker(seg) {
                         if opts.split && !stalled && !seg_frames.is_empty() && !voiced.contains(&sp) {
@@ -190,16 +216,22 @@ impl Tts {
                             voiced.push(sp);
                         }
                     }
+                    if stalled {
+                        // All attempts failed: keep the last one so the sentence is not
+                        // silently dropped from the file (same audio as the stream got).
+                        eprintln!("sentence {} kept stalled after {} attempts", i + 1, STALL_RETRIES + 1);
+                        kept_stalled.push(i);
+                    }
                     frames.extend(seg_frames);
                 }
-                Ok((frames, prompt_rows, first_prompt, segments.len()))
+                Ok((frames, prompt_rows, first_prompt, segments.len(), had_stall, kept_stalled))
             })();
             drop(tx);
             let decoded = worker.join().map_err(|_| anyhow!("codec thread panicked"))?;
             Ok((gen?, decoded?))
         })?;
-        let ((frames, prompt_rows, prompt, segments), (audio, first_audio)) = (gen, decoded);
-        Ok(Spoken { audio, frames, prompt_rows, prompt, segments, first_audio, elapsed: t0.elapsed() })
+        let ((frames, prompt_rows, prompt, segments, had_stall, kept_stalled), (audio, first_audio)) = (gen, decoded);
+        Ok(Spoken { audio, frames, prompt_rows, prompt, segments, first_audio, elapsed: t0.elapsed(), had_stall, kept_stalled })
     }
 }
 

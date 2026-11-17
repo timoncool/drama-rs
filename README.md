@@ -42,7 +42,7 @@ Prebuilt for Linux x86_64 (CUDA 12 runtime, Ampere or newer) on the
 brew install apiplant/tap/drama-rs     # Homebrew on Linux
 sudo apt install drama-rs              # apt.apiplant.com
 sudo pacman -S drama-rs                # apiplant.github.io/pacman
-cargo install drama-rs                 # from crates.io (needs nvcc; DRAMA_CUDA_ARCH, default sm_89)
+cargo install drama-rs --features cuda  # from crates.io (needs nvcc; DRAMA_CUDA_ARCH, default sm_89)
 ```
 
 Repository setup for apt and pacman is in [`packaging/README.md`](packaging/README.md#using-the-packages).
@@ -56,7 +56,12 @@ hf download apiplant/drama-q4 --local-dir models/drama-3-q4
 
 # 2. build (CUDA toolkit in /opt/cuda, or set CUDA_PATH; DRAMA_CUDA_ARCH defaults to sm_89,
 #    a comma-separated list such as sm_86,sm_89 builds for several GPUs)
-cargo build --release
+cargo build --release --features cuda
+```
+
+> Without CUDA (e.g. macOS) plain `cargo build` also compiles: `src/ffi.rs` then
+> provides stubs that fail at runtime. Native Apple-Silicon inference is coming
+> via the MLX port, tracked in [`docs/MLX-PORT.md`](docs/MLX-PORT.md).
 ```
 
 ### Converting from the original checkpoint (optional)

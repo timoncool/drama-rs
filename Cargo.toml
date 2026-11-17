@@ -19,6 +19,14 @@ name = "drama"
 default = ["cli"]
 # the `drama` command-line binary (clap). Disable default features to use drama as a library
 cli = ["dep:clap"]
+# NVIDIA CUDA backend: compiles kernels/*.cu with nvcc and links cudart/cublas.
+# Required for actual inference; off by default so the crate also builds where there
+# is no CUDA toolkit (e.g. Apple Silicon, the target of the MLX port in docs/MLX-PORT.md).
+cuda = []
+# Apple-Silicon backend: Metal device memory, command queues and hand-written MSL
+# kernels + CPU reference implementations (see docs/MLX-PORT.md). Mutually exclusive
+# with `cuda`.
+metal = ["dep:metal"]
 
 [[bin]]
 name = "drama"
@@ -31,6 +39,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 half = "2"
 hound = "3.5"
 memmap2 = "0.9"
+metal = { version = "0.33", optional = true }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

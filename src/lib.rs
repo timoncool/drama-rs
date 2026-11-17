@@ -19,6 +19,8 @@ pub mod codec;
 pub mod engine;
 pub mod ffi;
 pub mod gpu;
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+mod metal_backend;
 pub mod model;
 pub mod prompt;
 pub mod tts;

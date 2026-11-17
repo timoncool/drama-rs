@@ -59,7 +59,7 @@ jobs:
           key: x86_64-unknown-linux-gnu-cuda
 
       - name: Build
-        run: cargo build --profile dist --locked --bins
+        run: cargo build --profile dist --locked --bins --features cuda
 
       # --version does not touch the GPU, so it runs on the GPU-less runner
       # and proves the binary starts (links, right architecture).
@@ -106,7 +106,7 @@ jobs:
         shell: bash
         run: |
           export PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda CUDA_HOME=/opt/cuda
-          cargo build --profile dist --locked --bins
+          cargo build --profile dist --locked --bins --features cuda
 
       - name: Package
         shell: bash

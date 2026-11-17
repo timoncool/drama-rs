@@ -15,12 +15,21 @@ fn gencode(arch: &str) -> Vec<String> {
 }
 
 fn main() {
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/opt/cuda".to_string());
-    let arch = std::env::var("DRAMA_CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-env-changed=DRAMA_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    // Without the `cuda` feature there is nothing native to compile: src/ffi.rs
+    // provides stub functions with identical signatures that report the missing
+    // backend at runtime, so the crate still builds and links (e.g. on macOS).
+    if std::env::var("CARGO_FEATURE_CUDA").is_err() {
+        if std::env::var("CARGO_FEATURE_METAL").is_err() {
+            println!("cargo:warning=drama-rs: building without the `cuda` or `metal` features; inference will fail at runtime");
+        }
+        return;
+    }
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let cuda = std::env::var("CUDA_PATH").unwrap_or_else(|_| "/opt/cuda".to_string());
+    let arch = std::env::var("DRAMA_CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
 
     let mut objs = Vec::new();
     for src in ["drama", "codec"] {

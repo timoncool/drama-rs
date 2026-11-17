@@ -30,7 +30,7 @@ absent is skipped rather than failing the release.
 ## Builds
 
 - `binary`: an `nvidia/cuda:12.8.1-devel-ubuntu22.04` container (nvcc and the
-  CUDA libraries, no GPU needed), `cargo build --profile dist` for
+  CUDA libraries, no GPU needed), `cargo build --profile dist --features cuda` for
   `DRAMA_CUDA_ARCH=sm_80,sm_86,sm_89,sm_90,sm_120` (machine code for each, PTX
   of the newest). The archive, the `.deb` and the Homebrew formula use it; it
   links the CUDA 12 runtime (`libcudart.so.12`, `libcublas.so.12`).

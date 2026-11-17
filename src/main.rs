@@ -198,9 +198,25 @@ fn main() -> Result<()> {
                     audio_s / spoken.elapsed.as_secs_f64(),
                     spoken.first_audio.map(|d| d.as_secs_f64() * 1e3).unwrap_or(f64::NAN),
                 );
+                if !spoken.kept_stalled.is_empty() {
+                    let s: Vec<String> = spoken.kept_stalled.iter().map(|i| (i + 1).to_string()).collect();
+                    eprintln!("note: sentence(s) kept stalled in output (drone audible): {}", s.join(", "));
+                }
                 if let Some(path) = &out {
                     let path = if interactive { path.with_file_name(format!("{}-{n}.wav", path.file_stem().unwrap().to_string_lossy())) } else { path.clone() };
-                    codec::write_wav(&path, &spoken.audio)?;
+                    // Stalled attempts stay out of spoken.frames; when any sentence
+                    // stalled, the streamed audio holds the stall drone, so re-decode
+                    // the clean frames offline with a fresh codec stream instead.
+                    let audio: Vec<f32> = if spoken.had_stall && !spoken.frames.is_empty() {
+                        let flat: Vec<i32> = spoken.frames.iter().flat_map(|f| f[1..].iter().copied()).collect();
+                        let t1 = Instant::now();
+                        let a = tts.codec.decode(&flat)?;
+                        eprintln!("re-decoded {} clean frames in {:.0} ms (stall cut from file)", flat.len() / 10, t1.elapsed().as_secs_f64() * 1e3);
+                        a
+                    } else {
+                        spoken.audio
+                    };
+                    codec::write_wav(&path, &audio)?;
                     eprintln!("wrote {}", path.display());
                 }
                 if let Some(path) = &prompt_out {

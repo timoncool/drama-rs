@@ -21,8 +21,8 @@ export const SITE = {
   lead: "Fish Audio's 35B mixture-of-experts voice model on a single 24 GB card, in Rust and hand-written CUDA. Clone a voice from a few seconds of audio, write multi-speaker dialogue, and stream it to the speakers faster than real time. No PyTorch.",
   heroNote: "Decoding at 8.9x real time on an RTX 4090, with the first audio 50 to 120 ms after the prompt is ready.",
   demo: undefined as { href: string; label: string } | undefined,
-  cargo: `cargo install drama-rs                          # needs the CUDA toolkit (nvcc)
-DRAMA_CUDA_ARCH=sm_86 cargo install drama-rs     # for a GPU other than sm_89`,
+  cargo: `cargo install drama-rs --features cuda          # needs the CUDA toolkit (nvcc)
+DRAMA_CUDA_ARCH=sm_86 cargo install drama-rs --features cuda  # for a GPU other than sm_89`,
   terminal: {
     title: "drama",
     command: `drama speak --model drama-q4 --out x.wav --text "<|speaker:0|> [sighs] Fine. If we miss it, it's on you."`,
